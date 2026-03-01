@@ -1,0 +1,23 @@
+CI:
+  - changed-files:
+      - any-glob-to-any-file:
+          - .github/workflows/**
+
+Documentation:
+  - changed-files:
+      - any-glob-to-any-file:
+          - '**/*.md'
+          - docs/**
+
+eBPF:
+  - changed-files:
+      - any-glob-to-any-file:
+          - '**/*.c'
+          - '**/*.h'
+
+Go:
+  - changed-files:
+      - any-glob-to-any-file:
+          - '**/*.go'
+          - go.mod
+          - go.sum
