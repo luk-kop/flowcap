@@ -1,0 +1,41 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version: "1.26"
+
+      - name: Install eBPF dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang llvm linux-headers-$(uname -r) linux-libc-dev libc6-dev libbpf-dev
+
+      - name: Generate eBPF bindings
+        run: make generate
+
+      - name: Cross-compile binaries
+        run: |
+          GOARCH=amd64 go build -o flowcap-linux-amd64
+          GOARCH=arm64 go build -o flowcap-linux-arm64
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >
+          gh release create ${{ github.ref_name }}
+          flowcap-linux-amd64
+          flowcap-linux-arm64
+          --generate-notes
