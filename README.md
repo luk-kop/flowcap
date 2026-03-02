@@ -161,7 +161,7 @@ sudo ./flowcap -max-export-per-cycle 20000 eth0
 sudo ./flowcap -json wg0 | tee -a /var/log/flows.json
 
 # With statistics file for detailed logging
-sudo ./flowcap -stats-file /var/log/flow-stats.log wg0
+sudo ./flowcap -stats-file /var/log/flowcap-stats.log wg0
 
 # Enable Prometheus metrics endpoint
 sudo ./flowcap -metrics-addr 127.0.0.1:9090 wg0
@@ -205,7 +205,7 @@ Use `-stats-file` to log per-cycle statistics to a separate file. The format fol
 **Text (default):**
 
 ```bash
-sudo ./flowcap -stats-file /var/log/flow-stats.log wg0
+sudo ./flowcap -stats-file /var/log/flowcap-stats.log wg0
 ```
 
 ```text
@@ -216,7 +216,7 @@ sudo ./flowcap -stats-file /var/log/flow-stats.log wg0
 **JSON (`-json` flag):**
 
 ```bash
-sudo ./flowcap -json -stats-file /var/log/flow-stats.log wg0
+sudo ./flowcap -json -stats-file /var/log/flowcap-stats.log wg0
 ```
 
 ```json

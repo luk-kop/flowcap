@@ -2,17 +2,31 @@
 
 ## Systemd Service
 
+Create a dedicated system user (no home directory, no login shell):
+
+```bash
+sudo useradd --system --no-create-home --shell /usr/sbin/nologin flowcap
+```
+
 Install the binary:
 
 ```bash
 sudo cp flowcap /usr/local/bin/
+sudo chmod +x /usr/local/bin/flowcap
+```
+
+Create log files with correct ownership:
+
+```bash
+sudo touch /var/log/flowcap.log /var/log/flowcap-stats.log
+sudo chown flowcap:flowcap /var/log/flowcap.log /var/log/flowcap-stats.log
 ```
 
 Create an environment file `/etc/default/flowcap`:
 
 ```bash
 INTERFACE=eth0
-FLOWCAP_OPTS=-json -metrics-addr 127.0.0.1:9090 -stats-file /var/log/flow-stats.log
+FLOWCAP_OPTS=-json -metrics-addr 127.0.0.1:9090 -stats-file /var/log/flowcap-stats.log
 ```
 
 Create a service unit file `/etc/systemd/system/flowcap.service`:
@@ -24,6 +38,8 @@ After=network.target
 
 [Service]
 Type=simple
+User=flowcap
+Group=flowcap
 EnvironmentFile=/etc/default/flowcap
 ExecStart=/usr/local/bin/flowcap $FLOWCAP_OPTS $INTERFACE
 Restart=on-failure
@@ -31,6 +47,9 @@ RestartSec=5
 StandardOutput=append:/var/log/flowcap.log
 StandardError=journal
 SyslogIdentifier=flowcap
+AmbientCapabilities=CAP_BPF CAP_PERFMON CAP_NET_ADMIN
+CapabilityBoundingSet=CAP_BPF CAP_PERFMON CAP_NET_ADMIN
+NoNewPrivileges=true
 CPUQuota=10%
 MemoryMax=128M
 
@@ -66,7 +85,7 @@ journalctl -u flowcap -f
 Create `/etc/logrotate.d/flowcap` to prevent log files from growing indefinitely:
 
 ```text
-/var/log/flowcap.log /var/log/flow-stats.log {
+/var/log/flowcap.log /var/log/flowcap-stats.log {
     daily
     maxsize 100M
     rotate 14
