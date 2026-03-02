@@ -293,8 +293,8 @@ func TestPrintFlowJSON_AllFields(t *testing.T) {
 func TestDropCounterDelta_Normal(t *testing.T) {
 	fe := &flowExporter{}
 	// Simulate first cycle: counters go from 0 to some values
-	fe.prevDrops = [dropMax]uint64{0, 0, 0}
-	cumDrops := [dropMax]uint64{10, 20, 5}
+	fe.prevDrops = [dropMax]uint64{0, 0, 0, 0, 0}
+	cumDrops := [dropMax]uint64{10, 20, 5, 2, 1}
 
 	var drops [dropMax]uint64
 	for i := 0; i < dropMax; i++ {
@@ -315,9 +315,15 @@ func TestDropCounterDelta_Normal(t *testing.T) {
 	if drops[dropParseErr] != 5 {
 		t.Errorf("expected parse_err delta=5, got %d", drops[dropParseErr])
 	}
+	if drops[dropLinearize] != 2 {
+		t.Errorf("expected linearize delta=2, got %d", drops[dropLinearize])
+	}
+	if drops[dropMapFull] != 1 {
+		t.Errorf("expected map_full delta=1, got %d", drops[dropMapFull])
+	}
 
 	// Simulate second cycle: counters increase
-	cumDrops2 := [dropMax]uint64{15, 25, 5}
+	cumDrops2 := [dropMax]uint64{15, 25, 5, 3, 1}
 	var drops2 [dropMax]uint64
 	for i := 0; i < dropMax; i++ {
 		if cumDrops2[i] >= fe.prevDrops[i] {
@@ -337,15 +343,21 @@ func TestDropCounterDelta_Normal(t *testing.T) {
 	if drops2[dropParseErr] != 0 {
 		t.Errorf("expected parse_err delta=0, got %d", drops2[dropParseErr])
 	}
+	if drops2[dropLinearize] != 1 {
+		t.Errorf("expected linearize delta=1, got %d", drops2[dropLinearize])
+	}
+	if drops2[dropMapFull] != 0 {
+		t.Errorf("expected map_full delta=0, got %d", drops2[dropMapFull])
+	}
 }
 
 func TestDropCounterDelta_Reset(t *testing.T) {
 	fe := &flowExporter{}
 	// Simulate accumulated state from previous cycles
-	fe.prevDrops = [dropMax]uint64{100, 200, 50}
+	fe.prevDrops = [dropMax]uint64{100, 200, 50, 30, 10}
 
 	// Counter reset: current values are lower than previous (e.g. eBPF reload)
-	cumDrops := [dropMax]uint64{3, 0, 1}
+	cumDrops := [dropMax]uint64{3, 0, 1, 0, 2}
 
 	var drops [dropMax]uint64
 	for i := 0; i < dropMax; i++ {
@@ -367,13 +379,19 @@ func TestDropCounterDelta_Reset(t *testing.T) {
 	if drops[dropParseErr] != 1 {
 		t.Errorf("after reset, expected parse_err delta=1, got %d", drops[dropParseErr])
 	}
+	if drops[dropLinearize] != 0 {
+		t.Errorf("after reset, expected linearize delta=0, got %d", drops[dropLinearize])
+	}
+	if drops[dropMapFull] != 2 {
+		t.Errorf("after reset, expected map_full delta=2, got %d", drops[dropMapFull])
+	}
 }
 
 func TestDropReasonLabels(t *testing.T) {
 	if len(dropReasonLabels) != dropMax {
 		t.Fatalf("dropReasonLabels length %d != dropMax %d", len(dropReasonLabels), dropMax)
 	}
-	expected := [dropMax]string{"fragments", "non_ipv4", "parse_error"}
+	expected := [dropMax]string{"fragments", "non_ipv4", "parse_error", "linearize", "map_full"}
 	for i := 0; i < dropMax; i++ {
 		if dropReasonLabels[i] != expected[i] {
 			t.Errorf("dropReasonLabels[%d] = %q, want %q", i, dropReasonLabels[i], expected[i])

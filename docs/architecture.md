@@ -5,10 +5,10 @@ flowchart TD
     subgraph KERNEL["⚙️ Kernel Space — eBPF"]
         NIC[/"🌐 Network Interface<br/>ingress · egress"/]
         TC["TCX Hook<br/>TC eXpress · eBPF classifier"]
-        PULL["bpf_skb_pull_data<br/>linearize first 74 bytes"]
+        PULL["bpf_skb_pull_data<br/>linearize l2_hdr_len + 80 bytes"]
         PARSE["parse_packet<br/>validate headers<br/>extract 5-tuple"]
         FRAG{IP fragment<br/>or non-IPv4?}
-        DROPCNT["📈 Increment drop counter<br/>fragments<br/>non_ipv4<br/>parse_err"]
+        DROPCNT["📈 Increment drop counter<br/>fragments<br/>non_ipv4<br/>parse_err<br/>linearize<br/>map_full"]
         LOOKUP{Flow exists<br/>in LRU hash map?}
         UPDATE["⚡ Atomic update<br/>packets<br/>bytes<br/>last_seen<br/>tcp_flags"]
         INSERT["Insert new flow<br/>bpf_map_update_elem<br/>BPF_NOEXIST"]
@@ -110,18 +110,19 @@ The eBPF program runs in kernel space and is attached to the TC (Traffic Control
 
 **Per-packet processing (`flow_capture`):**
 
-1. Calls `bpf_skb_pull_data(skb, 74)` to linearize at least the first 74 bytes of the packet (ETH 14 + IP max 60), ensuring headers are in contiguous memory even for GRO-aggregated or non-linear skbs
+1. Calls `bpf_skb_pull_data(skb, l2_hdr_len + 80)` to linearize headers into contiguous memory. `l2_hdr_len` is a load-time constant set by the Go loader based on interface type: 14 (`ETH_HLEN`) for Ethernet (total 94 bytes) and 0 for L3 TUN/WireGuard (total 80 bytes). The 80 bytes cover worst-case IP header (60 bytes with options) plus TCP header (20 bytes).
 
-   > **Why this is needed:** The kernel stores a packet (`skb`) in two parts: *linear data* — a contiguous buffer accessible via `skb->data` to `skb->data_end` — and *paged data* — the rest of the packet scattered across memory pages, not directly accessible to eBPF. Normally headers land in the linear part, but with GRO (Generic Receive Offload, where the kernel merges many packets into one large buffer) or certain NIC drivers, the linear part can be very small — sometimes only the Ethernet + IP header fits, and the TCP/UDP header ends up in paged data. The eBPF program can only see the linear part, so the bounds check `(void *)(tcp + 1) > data_end` fails because `data_end` ends before the TCP header — causing `DROP_PARSE_ERR`. `bpf_skb_pull_data(skb, 74)` tells the kernel to pull at least 74 bytes into the linear part, guaranteeing that Ethernet, IP, and TCP/UDP headers are in contiguous memory before any pointer dereference.
+   > **Why this is needed:** The kernel stores a packet (`skb`) in two parts: *linear data* — a contiguous buffer accessible via `skb->data` to `skb->data_end` — and *paged data* — the rest of the packet scattered across memory pages, not directly accessible to eBPF. Normally headers land in the linear part, but with GRO (Generic Receive Offload, where the kernel merges many packets into one large buffer) or certain NIC drivers, the linear part can be very small — sometimes only the Ethernet + IP header fits, and the TCP/UDP header ends up in paged data. The eBPF program can only see the linear part, so the bounds check `(void *)(tcp + 1) > data_end` fails because `data_end` ends before the TCP header — causing `DROP_PARSE_ERR`. `bpf_skb_pull_data` tells the kernel to pull the required bytes into the linear part, guaranteeing that L2 (if present), IP, and TCP/UDP headers are in contiguous memory before any pointer dereference. If linearization fails, the packet is passed through and a `DROP_LINEARIZE` counter is incremented.
 2. Calls `parse_packet` to validate and extract flow information from the raw packet; if parsing fails, increments the appropriate drop counter (fragments, non-IPv4, or parse error) and passes the packet through
 3. Looks up the flow key in the LRU hash map
 4. If the flow exists — atomically increments packet count and byte count, overwrites last-seen timestamp, and OR-accumulates TCP flags
-5. If the flow does not exist — inserts a new entry with `BPF_NOEXIST`; if another CPU created the same flow between the lookup and insert (race condition), retries the lookup and updates the existing entry
+5. If the flow does not exist — inserts a new entry with `BPF_NOEXIST`; if another CPU created the same flow between the lookup and insert (race condition), retries the lookup and updates the existing entry; if the retry lookup also fails (map full, LRU eviction race), increments `DROP_MAP_FULL`
 6. Always returns `TC_ACT_OK` — the packet is never dropped, only observed (including when linearization fails)
 
 **Packet parsing (`parse_packet`):**
 
 - Operates on linearized skb data (headers guaranteed contiguous by `bpf_skb_pull_data` in `flow_capture`)
+- Supports both L2 (Ethernet) and L3 (TUN/WireGuard) interfaces: uses `skb->protocol` for protocol detection and a load-time constant `l2_hdr_len` to locate the IP header (14 bytes past `data` on Ethernet, 0 on L3 TUN)
 - Validates all pointer bounds before memory access (required by the eBPF verifier)
 - Accepts IPv4 only; non-IPv4 packets return a `DROP_NON_IPV4` code
 - Skips all fragmented IP packets (MF flag or fragment offset > 0), returning `DROP_FRAGMENTS` — subsequent fragments do not carry TCP/UDP port headers and cannot be matched to a flow
@@ -139,10 +140,12 @@ The eBPF program runs in kernel space and is attached to the TC (Traffic Control
 
 ## Drop Counters
 
-A separate `BPF_MAP_TYPE_PERCPU_ARRAY` map tracks packets that were skipped during parsing. Each CPU maintains its own counter (no contention), and the Go program sums them per export cycle. Three drop reasons are tracked:
+A separate `BPF_MAP_TYPE_PERCPU_ARRAY` map tracks packets that were skipped during parsing. Each CPU maintains its own counter (no contention), and the Go program sums them per export cycle. Five drop reasons are tracked:
 
 | Index | Reason        | Description                                          |
 |-------|---------------|------------------------------------------------------|
 | 0     | `fragments`   | IP fragmented packets (MF flag or fragment offset > 0) |
 | 1     | `non_ipv4`    | Non-IPv4 packets (IPv6, ARP, etc.)                   |
 | 2     | `parse_error` | Packets with invalid/truncated headers (after linearization) |
+| 3     | `linearize`   | `bpf_skb_pull_data` failed to linearize packet headers |
+| 4     | `map_full`    | Flow map insert failed and retry lookup also failed (LRU eviction race) |

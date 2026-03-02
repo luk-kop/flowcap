@@ -23,7 +23,7 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-//go:generate go run github.com/cilium/ebpf/cmd/bpf2go -type flow_key -type flow_stats flow flowcap.c
+//go:generate go run github.com/cilium/ebpf/cmd/bpf2go -go-package main -type flow_key -type flow_stats -cflags "-I/usr/include/$(uname -m)-linux-gnu" flow flowcap.c
 
 var (
 	// Prometheus metrics
@@ -33,7 +33,7 @@ var (
 	})
 	exportedTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "flowcap_exported_total",
-		Help: "Total number of exported flows by type",
+		Help: "Total exported flows by reason (active: periodic, inactive: idle timeout, closed: connection end)",
 	}, []string{"type"}) // type: active, inactive, closed
 	exportedBytes = prometheus.NewCounter(prometheus.CounterOpts{
 		Name: "flowcap_exported_bytes_total",
@@ -62,7 +62,7 @@ var (
 	droppedTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "flowcap_dropped_total",
 		Help: "Total packets dropped (not tracked as flows) by reason",
-	}, []string{"reason"}) // reason: fragments, non_ipv4, parse_error
+	}, []string{"reason"}) // reason: fragments, non_ipv4, parse_error, linearize, map_full
 )
 
 func init() {
@@ -79,13 +79,15 @@ func init() {
 
 // Drop counter indices matching eBPF defines
 const (
-	dropFragments = 0
-	dropNonIPv4   = 1
-	dropParseErr  = 2
-	dropMax       = 3
+	dropFragments  = 0
+	dropNonIPv4    = 1
+	dropParseErr   = 2
+	dropLinearize  = 3
+	dropMapFull    = 4
+	dropMax        = 5
 )
 
-var dropReasonLabels = [dropMax]string{"fragments", "non_ipv4", "parse_error"}
+var dropReasonLabels = [dropMax]string{"fragments", "non_ipv4", "parse_error", "linearize", "map_full"}
 
 func main() {
 	interval := flag.Int("interval", 10, "flow export interval in seconds")
@@ -154,7 +156,8 @@ func main() {
 	configMaxExport.Set(float64(*maxExportPerCycle))
 
 	iface := flag.Arg(0)
-	ifaceIndex := mustFindInterface(iface)
+	ifaceObj := mustFindInterface(iface)
+	ifaceIndex := ifaceObj.Index
 
 	// Open stats file if specified
 	var statsWriter *os.File
@@ -182,6 +185,17 @@ func main() {
 
 	// Override max_entries for flows map
 	spec.Maps["flows"].MaxEntries = uint32(*maxFlows)
+
+	// Detect L3 interfaces (TUN, WireGuard) — they have no hardware (MAC)
+	// address, so the eBPF program must skip the Ethernet header parse.
+	var l2HdrLen uint32 = 14 // ETH_HLEN default for L2 (Ethernet)
+	if len(ifaceObj.HardwareAddr) == 0 {
+		l2HdrLen = 0
+		log.Printf("Detected L3 interface %s (no MAC address), skipping L2 header parse", iface)
+	}
+	if err := spec.Variables["l2_hdr_len"].Set(l2HdrLen); err != nil {
+		log.Fatalf("Failed to set eBPF constant l2_hdr_len: %v", err)
+	}
 
 	objs := &flowObjects{}
 	if err := spec.LoadAndAssign(objs, nil); err != nil {
@@ -278,12 +292,12 @@ func main() {
 
 // ktimeNow returns the current monotonic clock time in nanoseconds using
 // CLOCK_MONOTONIC, matching the bpf_ktime_get_ns() helper used in the eBPF
-// program. Falls back to wall clock time if the syscall fails.
+// program. Fatally exits if the syscall fails — wrong timestamps from a wall
+// clock fallback would silently corrupt flow duration and timeout calculations.
 func ktimeNow() uint64 {
 	var ts unix.Timespec
 	if err := unix.ClockGettime(unix.CLOCK_MONOTONIC, &ts); err != nil {
-		log.Printf("Warning: ClockGettime failed: %v, falling back to wall clock", err)
-		return uint64(time.Now().UnixNano())
+		log.Fatalf("ClockGettime(CLOCK_MONOTONIC) failed: %v", err)
 	}
 	return uint64(ts.Sec)*1e9 + uint64(ts.Nsec)
 }
@@ -426,16 +440,18 @@ func (fe *flowExporter) exportFlows(flowMap *ebpf.Map, dropMap *ebpf.Map, timeou
 		var statsLine string
 		if jsonOutput {
 			record := map[string]interface{}{
-				"timestamp":      time.Now().Unix(),
-				"active":         activeCount,
-				"inactive":       inactiveCount,
-				"closed":         closedCount,
-				"total_flows":    currentFlows,
-				"total_bytes":    totalBytes,
-				"total_packets":  totalPackets,
-				"drop_fragments": drops[dropFragments],
-				"drop_non_ipv4":  drops[dropNonIPv4],
-				"drop_parse_err": drops[dropParseErr],
+				"timestamp":       time.Now().Unix(),
+				"active":          activeCount,
+				"inactive":        inactiveCount,
+				"closed":          closedCount,
+				"total_flows":     currentFlows,
+				"total_bytes":     totalBytes,
+				"total_packets":   totalPackets,
+				"drop_fragments":  drops[dropFragments],
+				"drop_non_ipv4":   drops[dropNonIPv4],
+				"drop_parse_err":  drops[dropParseErr],
+				"drop_linearize":  drops[dropLinearize],
+				"drop_map_full":   drops[dropMapFull],
 			}
 			data, err := json.Marshal(record)
 			if err != nil {
@@ -444,10 +460,10 @@ func (fe *flowExporter) exportFlows(flowMap *ebpf.Map, dropMap *ebpf.Map, timeou
 				statsLine = string(data) + "\n"
 			}
 		} else {
-			statsLine = fmt.Sprintf("[%s] Exported: %d active, %d inactive, %d closed | Total flows: %d | Bytes: %d | Packets: %d | Drops: fragments=%d non_ipv4=%d parse_err=%d\n",
+			statsLine = fmt.Sprintf("[%s] Exported: %d active, %d inactive, %d closed | Total flows: %d | Bytes: %d | Packets: %d | Drops: fragments=%d non_ipv4=%d parse_err=%d linearize=%d map_full=%d\n",
 				time.Now().Format("2006-01-02 15:04:05"),
 				activeCount, inactiveCount, closedCount, currentFlows, totalBytes, totalPackets,
-				drops[dropFragments], drops[dropNonIPv4], drops[dropParseErr])
+				drops[dropFragments], drops[dropNonIPv4], drops[dropParseErr], drops[dropLinearize], drops[dropMapFull])
 		}
 		if statsLine != "" {
 			_, _ = statsWriter.WriteString(statsLine)
@@ -497,10 +513,10 @@ func printFlow(key flowFlowKey, stats flowFlowStats, jsonOutput bool) {
 	}
 }
 
-// mustFindInterface looks up a network interface by name and returns its index.
+// mustFindInterface looks up a network interface by name and returns it.
 // Calls log.Fatalf if the interface does not exist. Logs a warning if the
 // interface is currently DOWN.
-func mustFindInterface(name string) int {
+func mustFindInterface(name string) *net.Interface {
 	iface, err := net.InterfaceByName(name)
 	if err != nil {
 		log.Fatalf("Failed to find interface %s: %v", name, err)
@@ -508,5 +524,5 @@ func mustFindInterface(name string) int {
 	if iface.Flags&net.FlagUp == 0 {
 		log.Printf("Warning: interface %s is currently DOWN, no packets will be captured until it comes UP", name)
 	}
-	return iface.Index
+	return iface
 }
