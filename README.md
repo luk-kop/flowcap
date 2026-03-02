@@ -60,6 +60,7 @@ See the [Architecture diagram](docs/architecture.md) for a visual overview of th
 - **IP fragmentation** - All fragmented IP packets are skipped; only complete packets with full TCP/UDP headers are processed (counted via drop counters)
 
   > **Note:** This is a standard approach in flow capture tools. Only the first fragment contains TCP/UDP port headers — subsequent fragments cannot be matched to a flow without reassembly, which is impractical in eBPF. In practice, TCP is almost never fragmented (MSS negotiation, PMTU discovery) and UDP fragmentation is rare on modern networks (MTU 1500+).
+- **Approximate flow count under rate limiting** - The `flowcap_map_flows` gauge is approximate when export rate limiting is active, because the eBPF program may concurrently insert or update flows while the Go exporter iterates the map, leading to missed or duplicate entries in the count
 - **Interface state** - Can attach to DOWN interfaces (captures start when interface comes UP); warning is logged at startup
 
 ## Build
@@ -208,8 +209,8 @@ sudo ./flowcap -stats-file /var/log/flow-stats.log wg0
 ```
 
 ```text
-[2026-02-28 16:08:00] Exported: 150 active, 5 inactive, 3 closed | Total flows: 1523 | Bytes: 524288 | Packets: 4096 | Drops: fragments=0 non_ipv4=12 parse_err=0
-[2026-02-28 16:08:10] Exported: 148 active, 2 inactive, 1 closed | Total flows: 1520 | Bytes: 412032 | Packets: 3200 | Drops: fragments=0 non_ipv4=8 parse_err=0
+[2026-02-28 16:08:00] Exported: 150 active, 5 inactive, 3 closed | Total flows: 1523 | Bytes: 524288 | Packets: 4096 | Drops: fragments=0 non_ipv4=12 parse_err=0 linearize=0 map_full=0
+[2026-02-28 16:08:10] Exported: 148 active, 2 inactive, 1 closed | Total flows: 1520 | Bytes: 412032 | Packets: 3200 | Drops: fragments=0 non_ipv4=8 parse_err=0 linearize=0 map_full=0
 ```
 
 **JSON (`-json` flag):**
@@ -219,7 +220,7 @@ sudo ./flowcap -json -stats-file /var/log/flow-stats.log wg0
 ```
 
 ```json
-{"timestamp":1709132400,"active":150,"inactive":5,"closed":3,"total_flows":1523,"total_bytes":524288,"total_packets":4096,"drop_fragments":0,"drop_non_ipv4":12,"drop_parse_err":0}
+{"timestamp":1709132400,"active":150,"inactive":5,"closed":3,"total_flows":1523,"total_bytes":524288,"total_packets":4096,"drop_fragments":0,"drop_non_ipv4":12,"drop_parse_err":0,"drop_linearize":0,"drop_map_full":0}
 ```
 
 ## Deployment

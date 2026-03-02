@@ -12,11 +12,18 @@
 
 #define MAX_FLOWS 65536 // placeholder, overridden by Go at runtime via spec.Maps["flows"].MaxEntries
 
+// L2 header length: 14 (ETH_HLEN) for Ethernet interfaces, 0 for L3
+// interfaces (TUN, WireGuard). Overridden by Go at load time via
+// spec.RewriteConstants based on detected interface type.
+volatile const __u32 l2_hdr_len = ETH_HLEN;
+
 // Drop counter indices
 #define DROP_FRAGMENTS  0
 #define DROP_NON_IPV4   1
 #define DROP_PARSE_ERR  2
-#define DROP_MAX        3
+#define DROP_LINEARIZE  3
+#define DROP_MAP_FULL   4
+#define DROP_MAX        5
 
 struct flow_key {
     __u32 src_ip;
@@ -59,15 +66,14 @@ static __always_inline int parse_packet(struct __sk_buff *skb, struct flow_key *
     void *data = (void *)(long)skb->data;
     void *data_end = (void *)(long)skb->data_end;
 
-    struct ethhdr *eth = data;
-    if ((void *)(eth + 1) > data_end)
-        return -(DROP_PARSE_ERR + 1);
-
-    // IPv4 only
-    if (eth->h_proto != bpf_htons(ETH_P_IP))
+    // Use skb->protocol instead of parsing ethhdr — works for both L2
+    // (Ethernet) and L3 (TUN/WireGuard) interfaces.
+    if (skb->protocol != bpf_htons(ETH_P_IP))
         return -(DROP_NON_IPV4 + 1);
 
-    struct iphdr *ip = (void *)(eth + 1);
+    // l2_hdr_len is the L2 header length: 14 for Ethernet, 0 for L3 TUN.
+    // Set at load time by Go based on detected interface type.
+    struct iphdr *ip = data + l2_hdr_len;
     if ((void *)(ip + 1) > data_end)
         return -(DROP_PARSE_ERR + 1);
 
@@ -111,11 +117,14 @@ static __always_inline int parse_packet(struct __sk_buff *skb, struct flow_key *
 
 SEC("classifier")
 int flow_capture(struct __sk_buff *skb) {
-    // Ensure at least the first 74 bytes (ETH 14 + IP 20-60 + TCP/UDP 8-20)
-    // are in linear memory. Non-linear skbs from GRO or certain NIC drivers
-    // can cause parse failures when headers span paged data.
-    if (bpf_skb_pull_data(skb, 74) < 0)
+    // Ensure headers are in linear memory. Pull l2_hdr_len (14 for Ethernet,
+    // 0 for L3 TUN) + 80 bytes (IP max 60 + TCP 20) to cover worst-case
+    // IP options plus transport header. Non-linear skbs from GRO or certain
+    // NIC drivers can cause parse failures when headers span paged data.
+    if (bpf_skb_pull_data(skb, l2_hdr_len + 80) < 0) {
+        inc_drop(DROP_LINEARIZE);
         return TC_ACT_OK;
+    }
 
     struct flow_key key = {};
     __u8 tcp_flags = 0;
@@ -153,6 +162,8 @@ int flow_capture(struct __sk_buff *skb) {
                 __sync_fetch_and_add(&stats->bytes, pkt_len);
                 __sync_lock_test_and_set(&stats->last_seen, now);
                 __sync_fetch_and_or(&stats->tcp_flags, tcp_flags);
+            } else {
+                inc_drop(DROP_MAP_FULL);
             }
         }
     }

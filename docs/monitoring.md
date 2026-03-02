@@ -12,9 +12,9 @@ sudo ./flowcap -metrics-addr 127.0.0.1:9090 wg0
 
 ```text
 flowcap_map_flows                           # Number of flows in the eBPF map at the start of the export cycle
-flowcap_exported_total{type="active"}       # Total exported active flows
-flowcap_exported_total{type="inactive"}     # Total exported inactive flows
-flowcap_exported_total{type="closed"}       # Total exported closed flows
+flowcap_exported_total{type="active"}       # Periodic snapshot exports
+flowcap_exported_total{type="inactive"}     # Idle timeout exports
+flowcap_exported_total{type="closed"}       # Connection end exports (TCP FIN/RST)
 flowcap_exported_bytes_total                # Total bytes exported
 flowcap_exported_packets_total              # Total packets exported
 flowcap_config_interval_seconds            # Configured export interval
@@ -24,6 +24,8 @@ flowcap_config_max_export_per_cycle        # Configured max flows per export cyc
 flowcap_dropped_total{reason="fragments"}  # Total dropped IP fragments
 flowcap_dropped_total{reason="non_ipv4"}   # Total dropped non-IPv4 packets (IPv6, ARP, etc.)
 flowcap_dropped_total{reason="parse_error"} # Total dropped packets due to parse errors
+flowcap_dropped_total{reason="linearize"}  # Total packets where header linearization failed
+flowcap_dropped_total{reason="map_full"}   # Total packets lost due to flow map insert + retry failure
 ```
 
 **Raw output example** (`curl http://127.0.0.1:9090/metrics`):
@@ -50,7 +52,7 @@ flowcap_exported_bytes_total 6.066156e+07
 # HELP flowcap_exported_packets_total Total packets exported across all flows
 # TYPE flowcap_exported_packets_total counter
 flowcap_exported_packets_total 53229
-# HELP flowcap_exported_total Total number of exported flows by type
+# HELP flowcap_exported_total Total exported flows by reason (active: periodic, inactive: idle timeout, closed: connection end)
 # TYPE flowcap_exported_total counter
 flowcap_exported_total{type="active"} 6292
 flowcap_exported_total{type="closed"} 35
@@ -88,7 +90,7 @@ rate(flowcap_exported_packets_total[1m])
 # Timeout rate (useful for tuning -timeout parameter)
 rate(flowcap_exported_total{type="inactive"}[5m])
 
-# Dropped packets by reason (fragments, non-IPv4, parse errors)
+# Dropped packets by reason (fragments, non-IPv4, parse errors, linearize, map full)
 rate(flowcap_dropped_total[5m])
 
 # Fragment drop rate (may indicate MTU/PMTUD issues)
