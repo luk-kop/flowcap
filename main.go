@@ -193,10 +193,8 @@ func main() {
 		l2HdrLen = 0
 		log.Printf("Detected L3 interface %s (no MAC address), skipping L2 header parse", iface)
 	}
-	if err := spec.RewriteConstants(map[string]interface{}{
-		"l2_hdr_len": l2HdrLen,
-	}); err != nil {
-		log.Fatalf("Failed to rewrite eBPF constants: %v", err)
+	if err := spec.Variables["l2_hdr_len"].Set(l2HdrLen); err != nil {
+		log.Fatalf("Failed to set eBPF constant l2_hdr_len: %v", err)
 	}
 
 	objs := &flowObjects{}
