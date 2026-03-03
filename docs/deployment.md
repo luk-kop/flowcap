@@ -5,14 +5,14 @@
 Create a dedicated system user (no home directory, no login shell):
 
 ```bash
-sudo useradd --system --no-create-home --shell /usr/sbin/nologin flowcap
+useradd --system --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin flowcap
 ```
 
 Install the binary:
 
 ```bash
 sudo cp flowcap /usr/local/bin/
-sudo chmod +x /usr/local/bin/flowcap
+sudo chmod 755 /usr/local/bin/flowcap
 ```
 
 Create log files with correct ownership:
