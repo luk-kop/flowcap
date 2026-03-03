@@ -121,7 +121,12 @@ int flow_capture(struct __sk_buff *skb) {
     // 0 for L3 TUN) + 80 bytes (IP max 60 + TCP 20) to cover worst-case
     // IP options plus transport header. Non-linear skbs from GRO or certain
     // NIC drivers can cause parse failures when headers span paged data.
-    if (bpf_skb_pull_data(skb, l2_hdr_len + 80) < 0) {
+    // Clamp to skb->len so small packets (TCP ACKs, small fragments) that
+    // are shorter than the requested pull size can still be linearized.
+    __u32 pull_len = l2_hdr_len + 80;
+    if (pull_len > skb->len)
+        pull_len = skb->len;
+    if (bpf_skb_pull_data(skb, pull_len) < 0) {
         inc_drop(DROP_LINEARIZE);
         return TC_ACT_OK;
     }
