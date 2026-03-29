@@ -5,7 +5,7 @@ go 1.26
 require (
 	github.com/cilium/ebpf v0.20.0
 	github.com/prometheus/client_golang v1.23.2
-	golang.org/x/sys v0.41.0
+	golang.org/x/sys v0.42.0
 )
 
 require (
