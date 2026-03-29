@@ -466,8 +466,12 @@ func (fe *flowExporter) exportFlows(flowMap *ebpf.Map, dropMap *ebpf.Map, timeou
 				drops[dropFragments], drops[dropNonIPv4], drops[dropParseErr], drops[dropLinearize], drops[dropMapFull])
 		}
 		if statsLine != "" {
-			_, _ = statsWriter.WriteString(statsLine)
-			_ = statsWriter.Sync()
+			if _, err := statsWriter.WriteString(statsLine); err != nil {
+				log.Printf("Failed to write stats: %v", err)
+			}
+			if err := statsWriter.Sync(); err != nil {
+				log.Printf("Failed to sync stats file: %v", err)
+			}
 		}
 	}
 }
@@ -475,8 +479,8 @@ func (fe *flowExporter) exportFlows(flowMap *ebpf.Map, dropMap *ebpf.Map, timeou
 // printFlow formats and prints a single flow record to stdout. Output is
 // either a JSON object or a human-readable one-liner depending on jsonOutput.
 func printFlow(key flowFlowKey, stats flowFlowStats, jsonOutput bool) {
-	srcIP := net.IP(binary.LittleEndian.AppendUint32(nil, key.SrcIp))
-	dstIP := net.IP(binary.LittleEndian.AppendUint32(nil, key.DstIp))
+	srcIP := net.IP(binary.NativeEndian.AppendUint32(nil, key.SrcIp))
+	dstIP := net.IP(binary.NativeEndian.AppendUint32(nil, key.DstIp))
 	var duration time.Duration
 	if stats.LastSeen >= stats.FirstSeen {
 		duration = time.Duration(stats.LastSeen - stats.FirstSeen)

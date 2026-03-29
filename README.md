@@ -62,6 +62,7 @@ See the [Architecture diagram](docs/architecture.md) for a visual overview of th
   > **Note:** This is a standard approach in flow capture tools. Only the first fragment contains TCP/UDP port headers — subsequent fragments cannot be matched to a flow without reassembly, which is impractical in eBPF. In practice, TCP is almost never fragmented (MSS negotiation, PMTU discovery) and UDP fragmentation is rare on modern networks (MTU 1500+).
 - **Approximate flow count under rate limiting** - The `flowcap_map_flows` gauge is approximate when export rate limiting is active, because the eBPF program may concurrently insert or update flows while the Go exporter iterates the map, leading to missed or duplicate entries in the count
 - **Interface state** - Can attach to DOWN interfaces (captures start when interface comes UP); warning is logged at startup
+- **Tunnel interfaces** - Flowcap captures traffic as seen by the specified interface. For VPN tunnels (`tun0`, `wg0`), this means decapsulated inner traffic; for physical interfaces (`eth0`), this means encrypted outer traffic
 
 ## Build
 

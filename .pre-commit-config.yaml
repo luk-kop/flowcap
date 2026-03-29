@@ -15,17 +15,33 @@ repos:
         language: system
         pass_filenames: false
         types: [go]
-
       - id: go-vet
         name: go vet
         entry: go vet ./...
         language: system
         pass_filenames: false
         types: [go]
-
       - id: go-test
         name: go test
         entry: go test ./...
         language: system
         pass_filenames: false
         types: [go]
+      - id: go-mod-tidy
+        name: go mod tidy
+        entry: bash -c 'go mod tidy && git diff --exit-code go.mod go.sum'
+        language: system
+        pass_filenames: false
+        types: [go]
+      - id: govulncheck
+        name: govulncheck
+        entry: govulncheck ./...
+        language: system
+        pass_filenames: false
+        types: [go]
+
+  - repo: https://github.com/compilerla/conventional-pre-commit
+    rev: v4.4.0
+    hooks:
+      - id: conventional-pre-commit
+        stages: [commit-msg]
