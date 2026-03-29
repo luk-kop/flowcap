@@ -34,3 +34,4 @@ notes/
 # Editor/IDE
 .idea/
 .vscode/
+.kiro/
