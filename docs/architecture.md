@@ -84,12 +84,14 @@ Key: flow_key {
 
 Value: flow_stats {
     packets             // Packet count (64-bit)
-    bytes               // Byte count (64-bit)
+    bytes               // TC-layer skb->len byte count (64-bit)
     first_seen          // Timestamp (nanoseconds)
     last_seen           // Timestamp (nanoseconds)
     tcp_flags           // TCP flags (SYN, FIN, RST, etc.)
 }
 ```
+
+`bytes` is copied from `skb->len` at the TC hook. Treat it as the kernel packet length visible at Flowcap's attachment point when comparing it with NIC counters, tcpdump totals, or another flow exporter. Known-size packet tests showed `1042` Flowcap bytes for tcpdump IPv4 `length 1028` on loopback and `wlp0s20f3`, confirming a 14-byte link-layer contribution on those TC paths. The same test reported `1028` Flowcap bytes for tcpdump IPv4 `length 1028` on `tun0` and `wg0`, matching raw IP length on those L3 tunnels.
 
 **Lifecycle:**
 
@@ -110,19 +112,19 @@ The eBPF program runs in kernel space and is attached to the TC (Traffic Control
 
 **Per-packet processing (`flow_capture`):**
 
-1. Calls `bpf_skb_pull_data(skb, pull_len)` to linearize headers into contiguous memory. `pull_len` is `l2_hdr_len + 80`, clamped to `skb->len` so that packets shorter than the requested size (e.g. TCP ACKs at 40 bytes on TUN) are fully linearized instead of failing. `l2_hdr_len` is a load-time constant set by the Go loader based on interface type: 14 (`ETH_HLEN`) for Ethernet (total 94 bytes) and 0 for L3 TUN/WireGuard (total 80 bytes). The 80 bytes cover worst-case IP header (60 bytes with options) plus TCP header (20 bytes).
+1. Calls `bpf_skb_pull_data(skb, pull_len)` to linearize headers into contiguous memory. `pull_len` is `l2_hdr_len + 80`, clamped to `skb->len` so that packets shorter than the requested size (e.g. TCP ACKs at 40 bytes on TUN) are fully linearized instead of failing. `l2_hdr_len` is a load-time constant set by the Go loader based on interface type: 14 (`ETH_HLEN`) for Ethernet and loopback (total 94 bytes) and 0 for L3 TUN/WireGuard (total 80 bytes). The 80 bytes cover worst-case IP header (60 bytes with options) plus TCP header (20 bytes).
 
    > **Why this is needed:** The kernel stores a packet (`skb`) in two parts: *linear data* — a contiguous buffer accessible via `skb->data` to `skb->data_end` — and *paged data* — the rest of the packet scattered across memory pages, not directly accessible to eBPF. Normally headers land in the linear part, but with GRO (Generic Receive Offload, where the kernel merges many packets into one large buffer) or certain NIC drivers, the linear part can be very small — sometimes only the Ethernet + IP header fits, and the TCP/UDP header ends up in paged data. The eBPF program can only see the linear part, so the bounds check `(void *)(tcp + 1) > data_end` fails because `data_end` ends before the TCP header — causing `DROP_PARSE_ERR`. `bpf_skb_pull_data` tells the kernel to pull the required bytes into the linear part, guaranteeing that L2 (if present), IP, and TCP/UDP headers are in contiguous memory before any pointer dereference. If linearization fails, the packet is passed through and a `DROP_LINEARIZE` counter is incremented.
 2. Calls `parse_packet` to validate and extract flow information from the raw packet; if parsing fails, increments the appropriate drop counter (fragments, non-IPv4, or parse error) and passes the packet through
 3. Looks up the flow key in the LRU hash map
-4. If the flow exists — atomically increments packet count and byte count, overwrites last-seen timestamp, and OR-accumulates TCP flags
+4. If the flow exists — atomically increments packet count and byte count (`skb->len`), overwrites last-seen timestamp, and OR-accumulates TCP flags
 5. If the flow does not exist — inserts a new entry with `BPF_NOEXIST`; if another CPU created the same flow between the lookup and insert (race condition), retries the lookup and updates the existing entry; if the retry lookup also fails (map full, LRU eviction race), increments `DROP_MAP_FULL`
 6. Always returns `TC_ACT_OK` — the packet is never dropped, only observed (including when linearization fails)
 
 **Packet parsing (`parse_packet`):**
 
 - Operates on linearized skb data (headers guaranteed contiguous by `bpf_skb_pull_data` in `flow_capture`)
-- Supports both L2 (Ethernet) and L3 (TUN/WireGuard) interfaces: uses `skb->protocol` for protocol detection and a load-time constant `l2_hdr_len` to locate the IP header (14 bytes past `data` on Ethernet, 0 on L3 TUN)
+- Supports both L2-style (Ethernet, loopback) and L3 (TUN/WireGuard) interfaces: uses `skb->protocol` for protocol detection and a load-time constant `l2_hdr_len` to locate the IP header (14 bytes past `data` on Ethernet/loopback, 0 on L3 TUN)
 - Validates all pointer bounds before memory access (required by the eBPF verifier)
 - Accepts IPv4 only; non-IPv4 packets return a `DROP_NON_IPV4` code
 - Skips all fragmented IP packets (MF flag or fragment offset > 0), returning `DROP_FRAGMENTS` — subsequent fragments do not carry TCP/UDP port headers and cannot be matched to a flow
