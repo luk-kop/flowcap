@@ -15,6 +15,12 @@ sudo cp flowcap /usr/local/bin/
 sudo chmod 755 /usr/local/bin/flowcap
 ```
 
+Check the embedded version metadata:
+
+```bash
+/usr/local/bin/flowcap --version
+```
+
 Create log files with correct ownership:
 
 ```bash
@@ -79,6 +85,21 @@ tail -f /var/log/flowcap.log
 # Service logs
 journalctl -u flowcap -f
 ```
+
+On startup, flowcap logs the embedded `version`, `revision`, and `build_date` values along with the selected interface and runtime options. This helps confirm which build is running under systemd after upgrades.
+
+## Troubleshooting Capabilities
+
+Flowcap calls `rlimit.RemoveMemlock()` during startup before loading eBPF objects. On the supported Linux 6.6+ kernels this should normally be handled by cgroup-based BPF memory accounting and the service capabilities above are sufficient.
+
+If startup fails with a memlock or `RLIMIT_MEMLOCK` error on a custom kernel or host with unusual BPF memory accounting settings, test whether adding `CAP_SYS_RESOURCE` resolves it:
+
+```ini
+AmbientCapabilities=CAP_BPF CAP_PERFMON CAP_NET_ADMIN CAP_SYS_RESOURCE
+CapabilityBoundingSet=CAP_BPF CAP_PERFMON CAP_NET_ADMIN CAP_SYS_RESOURCE
+```
+
+Do not add `CAP_SYS_RESOURCE` by default unless the host requires it; it is broader than the normal Flowcap runtime capability set.
 
 ## Log Rotation
 

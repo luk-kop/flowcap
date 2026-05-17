@@ -12,8 +12,8 @@
 
 #define MAX_FLOWS 65536 // placeholder, overridden by Go at runtime via spec.Maps["flows"].MaxEntries
 
-// L2 header length: 14 (ETH_HLEN) for Ethernet interfaces, 0 for L3
-// interfaces (TUN, WireGuard). Overridden by Go at load time via
+// L2 header length: 14 (ETH_HLEN) for Ethernet/loopback interfaces, 0 for
+// L3 interfaces (TUN, WireGuard). Overridden by Go at load time via
 // spec.RewriteConstants based on detected interface type.
 volatile const __u32 l2_hdr_len = ETH_HLEN;
 
@@ -71,7 +71,7 @@ static __always_inline int parse_packet(struct __sk_buff *skb, struct flow_key *
     if (skb->protocol != bpf_htons(ETH_P_IP))
         return -(DROP_NON_IPV4 + 1);
 
-    // l2_hdr_len is the L2 header length: 14 for Ethernet, 0 for L3 TUN.
+    // l2_hdr_len is the L2 header length: 14 for Ethernet/loopback, 0 for L3 TUN.
     // Set at load time by Go based on detected interface type.
     struct iphdr *ip = data + l2_hdr_len;
     if ((void *)(ip + 1) > data_end)
@@ -117,8 +117,8 @@ static __always_inline int parse_packet(struct __sk_buff *skb, struct flow_key *
 
 SEC("classifier")
 int flow_capture(struct __sk_buff *skb) {
-    // Ensure headers are in linear memory. Pull l2_hdr_len (14 for Ethernet,
-    // 0 for L3 TUN) + 80 bytes (IP max 60 + TCP 20) to cover worst-case
+    // Ensure headers are in linear memory. Pull l2_hdr_len (14 for Ethernet
+    // and loopback, 0 for L3 TUN) + 80 bytes (IP max 60 + TCP 20) to cover worst-case
     // IP options plus transport header. Non-linear skbs from GRO or certain
     // NIC drivers can cause parse failures when headers span paged data.
     // Clamp to skb->len so small packets (TCP ACKs, small fragments) that

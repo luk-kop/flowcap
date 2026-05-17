@@ -9,15 +9,15 @@ permissions:
   contents: write
 
 env:
-  GO_VERSION: "1.26"
+  GO_VERSION: "1.26.3"
 
 jobs:
-  release:
+  lint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
-      - uses: actions/setup-go@v6
+      - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6
         with:
           go-version: ${{ env.GO_VERSION }}
 
@@ -29,16 +29,115 @@ jobs:
       - name: Generate eBPF bindings
         run: make generate
 
-      - name: Cross-compile binaries
+      - name: Format Check
         run: |
-          GOARCH=amd64 go build -o flowcap-linux-amd64
-          GOARCH=arm64 go build -o flowcap-linux-arm64
+          files="$(gofmt -l .)"
+          if [ -n "$files" ]; then
+            echo "$files"
+            exit 1
+          fi
+
+      - name: Module Tidy Check
+        run: go mod tidy -diff
+
+      - name: Lint
+        uses: golangci/golangci-lint-action@1e7e51e771db61008b38414a730f564565cf7c20 # v9
+
+      - name: Vet
+        run: go vet ./...
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: Install eBPF dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang llvm linux-headers-$(uname -r) linux-libc-dev libc6-dev libbpf-dev
+
+      - name: Generate eBPF bindings
+        run: make generate
+
+      - name: Test
+        run: go test -v -short ./...
+
+  race-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: Install eBPF dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang llvm linux-headers-$(uname -r) linux-libc-dev libc6-dev libbpf-dev
+
+      - name: Generate eBPF bindings
+        run: make generate
+
+      - name: Race Test
+        run: go test -race -short ./...
+
+  build:
+    runs-on: ubuntu-latest
+    needs: [lint, test, race-test]
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: Install eBPF dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang llvm linux-headers-$(uname -r) linux-libc-dev libc6-dev libbpf-dev
+
+      - name: Build
+        env:
+          VERSION: ${{ github.ref_name }}
+        run: make build
+
+  release:
+    runs-on: ubuntu-latest
+    needs: [build]
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: Install eBPF dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang llvm linux-headers-$(uname -r) linux-libc-dev libc6-dev libbpf-dev
+
+      - name: Build release binaries
+        env:
+          VERSION: ${{ github.ref_name }}
+        run: make build-release
 
       - name: Create GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: >
-          gh release create ${{ github.ref_name }}
-          flowcap-linux-amd64
-          flowcap-linux-arm64
-          --generate-notes
+          TAG: ${{ github.ref_name }}
+        run: |
+          V="${TAG#v}"
+          gh release create "$TAG" \
+            "bin/flowcap_${V}_linux_amd64.tar.gz" \
+            "bin/flowcap_${V}_linux_arm64.tar.gz" \
+            "bin/checksums.txt" \
+            --generate-notes

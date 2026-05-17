@@ -1,12 +1,17 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"io"
+	"net"
 	"os"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/prometheus/client_golang/prometheus"
+	dto "github.com/prometheus/client_model/go"
 )
 
 // captureStdout runs fn and returns whatever it wrote to os.Stdout.
@@ -406,4 +411,311 @@ func TestFlowExporterZeroInit(t *testing.T) {
 			t.Errorf("expected prevDrops[%d]=0 on init, got %d", i, fe.prevDrops[i])
 		}
 	}
+}
+
+func TestRunVersionDoesNotRequireInterface(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+
+	code := run([]string{"--version"}, &stdout, &stderr)
+
+	if code != 0 {
+		t.Fatalf("expected exit code 0, got %d; stderr=%q", code, stderr.String())
+	}
+	if got := stdout.String(); !strings.Contains(got, "revision=") || !strings.Contains(got, "build_date=") {
+		t.Fatalf("expected version metadata, got %q", got)
+	}
+	if stderr.Len() != 0 {
+		t.Fatalf("expected empty stderr, got %q", stderr.String())
+	}
+}
+
+func TestRunMissingInterfaceReturnsUsage(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+
+	code := run(nil, &stdout, &stderr)
+
+	if code != 1 {
+		t.Fatalf("expected exit code 1, got %d", code)
+	}
+	if stdout.Len() != 0 {
+		t.Fatalf("expected empty stdout, got %q", stdout.String())
+	}
+	if !strings.Contains(stderr.String(), "Usage: flowcap [options] <interface>") {
+		t.Fatalf("expected usage on stderr, got %q", stderr.String())
+	}
+}
+
+func TestRunRejectsInvalidMetricsAddr(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+
+	code := run([]string{"-metrics-addr", "localhost:9090", "eth0"}, &stdout, &stderr)
+
+	if code != 1 {
+		t.Fatalf("expected exit code 1, got %d", code)
+	}
+	if !strings.Contains(stderr.String(), "is not a valid IP address") {
+		t.Fatalf("expected invalid IP error, got %q", stderr.String())
+	}
+}
+
+func TestStartupLogLineIncludesVersionMetadata(t *testing.T) {
+	oldVersion, oldRevision, oldBuildDate := version, revision, buildDate
+	version, revision, buildDate = "v-test", "abc123", "2026-05-17T12:00:00Z"
+	t.Cleanup(func() {
+		version, revision, buildDate = oldVersion, oldRevision, oldBuildDate
+	})
+
+	line := startupLogLine("eth0", 10, 60, 16384, 10000, true, "127.0.0.1:9090", "/tmp/stats.log")
+
+	for _, want := range []string{
+		"version=v-test",
+		"revision=abc123",
+		"build_date=2026-05-17T12:00:00Z",
+		"interface=eth0",
+		"interval=10s",
+		"timeout=60s",
+		"max_flows=16384",
+		"max_export_per_cycle=10000",
+		"json=true",
+		`metrics_addr="127.0.0.1:9090"`,
+		`stats_file="/tmp/stats.log"`,
+	} {
+		if !strings.Contains(line, want) {
+			t.Fatalf("expected startup log line to contain %q, got %q", want, line)
+		}
+	}
+}
+
+func TestL2HeaderLenForLinkType(t *testing.T) {
+	tests := []struct {
+		name         string
+		linkType     int
+		hardwareAddr net.HardwareAddr
+		want         uint32
+	}{
+		{name: "ethernet", linkType: arphrdEther, hardwareAddr: net.HardwareAddr{0x02, 0x00, 0x00, 0x00, 0x00, 0x01}, want: ethHeaderLen},
+		{name: "loopback", linkType: arphrdLoopback, want: ethHeaderLen},
+		{name: "tun wireguard", linkType: arphrdNone, want: 0},
+		{name: "unknown with hardware address", linkType: 9999, hardwareAddr: net.HardwareAddr{0x02, 0x00, 0x00, 0x00, 0x00, 0x01}, want: ethHeaderLen},
+		{name: "unknown without hardware address", linkType: 9999, want: 0},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := l2HeaderLenForLinkType(tt.linkType, tt.hardwareAddr); got != tt.want {
+				t.Fatalf("expected l2 header length %d, got %d", tt.want, got)
+			}
+		})
+	}
+}
+
+func TestExportRecordsRateLimit(t *testing.T) {
+	fe := &flowExporter{}
+	records := []flowRecord{
+		{
+			key: flowFlowKey{SrcIp: 0x0100007f, DstIp: 0x0200007f, SrcPort: 1000, DstPort: 80, Protocol: 6},
+			stats: flowFlowStats{
+				Packets:   2,
+				Bytes:     200,
+				FirstSeen: uint64(9 * time.Second),
+				LastSeen:  uint64(10 * time.Second),
+				TcpFlags:  0x02,
+			},
+		},
+		{
+			key: flowFlowKey{SrcIp: 0x0300007f, DstIp: 0x0400007f, SrcPort: 2000, DstPort: 443, Protocol: 6},
+			stats: flowFlowStats{
+				Packets:   3,
+				Bytes:     300,
+				FirstSeen: uint64(7 * time.Second),
+				LastSeen:  uint64(8 * time.Second),
+				TcpFlags:  0x04,
+			},
+		},
+		{
+			key: flowFlowKey{SrcIp: 0x0500007f, DstIp: 0x0600007f, SrcPort: 3000, DstPort: 53, Protocol: 17},
+			stats: flowFlowStats{
+				Packets:   4,
+				Bytes:     400,
+				FirstSeen: uint64(1 * time.Second),
+				LastSeen:  uint64(2 * time.Second),
+				TcpFlags:  0,
+			},
+		},
+	}
+	cumDrops := [dropMax]uint64{dropFragments: 5}
+	var output, stats bytes.Buffer
+
+	activeBefore := counterValue(t, "active")
+	closedBefore := counterValue(t, "closed")
+	inactiveBefore := counterValue(t, "inactive")
+
+	summary := fe.exportRecords(records, cumDrops, uint64(10*time.Second), 5, false, 2, &output, &stats)
+
+	if !summary.rateLimited {
+		t.Fatal("expected rateLimited=true")
+	}
+	if summary.currentFlows != 3 {
+		t.Fatalf("expected currentFlows=3, got %d", summary.currentFlows)
+	}
+	if summary.exportedCount != 2 {
+		t.Fatalf("expected exportedCount=2, got %d", summary.exportedCount)
+	}
+	if len(summary.keysToDelete) != 2 {
+		t.Fatalf("expected 2 keys to delete, got %d", len(summary.keysToDelete))
+	}
+	if summary.activeCount != 1 || summary.closedCount != 1 || summary.inactiveCount != 0 {
+		t.Fatalf("unexpected classifications: active=%d closed=%d inactive=%d", summary.activeCount, summary.closedCount, summary.inactiveCount)
+	}
+	if summary.totalBytes != 500 || summary.totalPackets != 5 {
+		t.Fatalf("unexpected totals: bytes=%d packets=%d", summary.totalBytes, summary.totalPackets)
+	}
+	if summary.drops[dropFragments] != 5 {
+		t.Fatalf("expected fragments drop delta=5, got %d", summary.drops[dropFragments])
+	}
+	if lines := strings.Count(strings.TrimSpace(output.String()), "\n") + 1; lines != 2 {
+		t.Fatalf("expected 2 output lines, got %d: %q", lines, output.String())
+	}
+	if !strings.Contains(stats.String(), "Exported: 1 active, 0 inactive, 1 closed") {
+		t.Fatalf("unexpected stats output: %q", stats.String())
+	}
+	if got := counterValue(t, "active") - activeBefore; got != 1 {
+		t.Fatalf("expected active counter +1, got %v", got)
+	}
+	if got := counterValue(t, "closed") - closedBefore; got != 1 {
+		t.Fatalf("expected closed counter +1, got %v", got)
+	}
+	if got := counterValue(t, "inactive") - inactiveBefore; got != 0 {
+		t.Fatalf("expected inactive counter unchanged, got %v", got)
+	}
+}
+
+func TestExportRecordsDropCounterReset(t *testing.T) {
+	fe := &flowExporter{
+		prevDrops: [dropMax]uint64{
+			dropFragments: 10,
+		},
+	}
+	cumDrops := [dropMax]uint64{
+		dropFragments: 2,
+	}
+	var output, stats bytes.Buffer
+
+	summary := fe.exportRecords(nil, cumDrops, uint64(10*time.Second), 5, false, 10, &output, &stats)
+
+	if summary.drops[dropFragments] != 2 {
+		t.Fatalf("expected fragments drop delta after reset=2, got %d", summary.drops[dropFragments])
+	}
+	if fe.prevDrops[dropFragments] != 2 {
+		t.Fatalf("expected prevDrops to be updated after reset, got %d", fe.prevDrops[dropFragments])
+	}
+}
+
+func TestExportRecordsDoesNotTreatTypedNilStatsFileAsWriter(t *testing.T) {
+	fe := &flowExporter{}
+	var output bytes.Buffer
+	var statsFile *os.File
+	var statsWriter io.Writer
+	if statsFile != nil {
+		statsWriter = statsFile
+	}
+
+	summary := fe.exportRecords(nil, [dropMax]uint64{}, uint64(10*time.Second), 5, true, 10, &output, statsWriter)
+
+	if summary.currentFlows != 0 {
+		t.Fatalf("expected no records, got %d", summary.currentFlows)
+	}
+	if output.Len() != 0 {
+		t.Fatalf("expected empty output, got %q", output.String())
+	}
+}
+
+func TestBuildInfoMetric(t *testing.T) {
+	buildInfo.WithLabelValues("test-version", "test-revision", "test-date").Set(1)
+
+	metric, err := buildInfo.GetMetricWithLabelValues("test-version", "test-revision", "test-date")
+	if err != nil {
+		t.Fatalf("GetMetricWithLabelValues: %v", err)
+	}
+	var dtoMetric dto.Metric
+	if err := metric.Write(&dtoMetric); err != nil {
+		t.Fatalf("metric.Write: %v", err)
+	}
+	if got := dtoMetric.GetGauge().GetValue(); got != 1 {
+		t.Fatalf("expected build info gauge=1, got %v", got)
+	}
+}
+
+func TestCaptureInfoMetric(t *testing.T) {
+	captureInfo.WithLabelValues("test0", "14").Set(1)
+
+	metric, err := captureInfo.GetMetricWithLabelValues("test0", "14")
+	if err != nil {
+		t.Fatalf("GetMetricWithLabelValues: %v", err)
+	}
+	var dtoMetric dto.Metric
+	if err := metric.Write(&dtoMetric); err != nil {
+		t.Fatalf("metric.Write: %v", err)
+	}
+	if got := dtoMetric.GetGauge().GetValue(); got != 1 {
+		t.Fatalf("expected capture info gauge=1, got %v", got)
+	}
+}
+
+func TestMetricLabelsArePreinitialized(t *testing.T) {
+	families, err := prometheus.DefaultGatherer.Gather()
+	if err != nil {
+		t.Fatalf("Gather: %v", err)
+	}
+
+	exportedFamily := metricFamily(t, families, "flowcap_exported_flows_total")
+	for _, reason := range exportReasonLabels {
+		if !hasMetricLabel(exportedFamily, "reason", reason) {
+			t.Fatalf("expected exported reason %q to be preinitialized", reason)
+		}
+	}
+
+	droppedFamily := metricFamily(t, families, "flowcap_dropped_packets_total")
+	for _, reason := range dropReasonLabels {
+		if !hasMetricLabel(droppedFamily, "reason", reason) {
+			t.Fatalf("expected drop reason %q to be preinitialized", reason)
+		}
+	}
+}
+
+func metricFamily(t *testing.T, families []*dto.MetricFamily, name string) *dto.MetricFamily {
+	t.Helper()
+
+	for _, family := range families {
+		if family.GetName() == name {
+			return family
+		}
+	}
+	t.Fatalf("metric family %q not found", name)
+	return nil
+}
+
+func hasMetricLabel(family *dto.MetricFamily, labelName, labelValue string) bool {
+	for _, metric := range family.GetMetric() {
+		for _, label := range metric.GetLabel() {
+			if label.GetName() == labelName && label.GetValue() == labelValue {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func counterValue(t *testing.T, label string) float64 {
+	t.Helper()
+
+	counter, err := exportedFlowsTotal.GetMetricWithLabelValues(label)
+	if err != nil {
+		t.Fatalf("GetMetricWithLabelValues(%q): %v", label, err)
+	}
+	var metric dto.Metric
+	if err := counter.Write(&metric); err != nil {
+		t.Fatalf("counter.Write(%q): %v", label, err)
+	}
+	return metric.GetCounter().GetValue()
 }
