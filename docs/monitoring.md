@@ -5,7 +5,7 @@
 Prometheus metrics are disabled by default. Enable with `-metrics-addr`:
 
 ```bash
-sudo ./flowcap -metrics-addr 127.0.0.1:9090 wg0
+sudo ./bin/flowcap -metrics-addr 127.0.0.1:9090 wg0
 ```
 
 **Available metrics:**
@@ -121,7 +121,7 @@ rate(flowcap_dropped_packets_total{reason="fragments"}[5m])
 Use `-json` flag to output structured JSON for log collectors (Promtail, Filebeat, etc.):
 
 ```bash
-sudo ./flowcap -json wg0 | tee -a /var/log/flows.json
+sudo ./bin/flowcap -json wg0 | tee -a /var/log/flows.json
 ```
 
 **Promtail (Loki) configuration:**

@@ -107,22 +107,29 @@ sudo apt install clang llvm linux-headers-$(uname -r) linux-libc-dev libc6-dev l
 make
 ```
 
-This compiles eBPF C code into Go bindings (via `bpf2go`) and builds the binary.
+This compiles eBPF C code into Go bindings (via `bpf2go`) and builds the binary into `bin/flowcap`.
 
-Other targets:
+Run `make help` to list all available targets:
 
 ```bash
-make generate   # only regenerate eBPF bindings
-make build      # regenerate eBPF bindings and build flowcap with version metadata
+make generate       # regenerate eBPF Go bindings via bpf2go
+make tidy           # sync Go module dependencies
+make update-patch   # update dependencies (patch only, safe)
+make update-minor   # update dependencies (minor + patch)
+make fmt            # format Go sources
+make test           # regenerate eBPF bindings and run all tests
+make build          # build the flowcap binary with version metadata
 make build-release  # build Linux amd64/arm64 release archives and checksums
-make test       # regenerate eBPF bindings and run Go tests
-make clean      # remove binary and generated files
+make run            # build and run flowcap (override with ARGS="...")
+make clean          # remove build artifacts
 ```
+
+> **Note:** `make generate` writes its output (`flow_bpfel.go`, `flow_bpfeb.go` and the embedded `flow_bpf*.o` objects) into the project root, not `bin/`. These are generated build *inputs*: the `.go` files are part of `package main`, sit next to `main.go`, and are committed. The `.o` objects are pulled in via relative `//go:embed`, ignored by git, and removed by `make clean`.
 
 The build embeds version metadata from git:
 
 ```bash
-./flowcap --version
+./bin/flowcap --version
 ```
 
 ```text
@@ -152,7 +159,7 @@ sudo ln -sf /usr/include/x86_64-linux-gnu/asm /usr/include/asm
 ## Usage
 
 ```bash
-sudo ./flowcap wg0
+sudo ./bin/flowcap wg0
 ```
 
 Captures flows on `wg0` and exports every 10 seconds to stdout.
@@ -160,7 +167,7 @@ Captures flows on `wg0` and exports every 10 seconds to stdout.
 ### Options
 
 ```bash
-sudo ./flowcap [options] <interface>
+sudo ./bin/flowcap [options] <interface>
 
 Options:
   -interval int
@@ -185,31 +192,31 @@ Options:
 
 ```bash
 # Default settings (10s export interval, 60s inactivity timeout, 16384 max flows)
-sudo ./flowcap eth0
+sudo ./bin/flowcap eth0
 
 # Export every 5 seconds, 30s inactivity timeout
-sudo ./flowcap -interval 5 -timeout 30 wg0
+sudo ./bin/flowcap -interval 5 -timeout 30 wg0
 
 # High-traffic interface with more flow capacity
-sudo ./flowcap -max-flows 131072 eth0
+sudo ./bin/flowcap -max-flows 131072 eth0
 
 # High-traffic interface with higher export rate limit
-sudo ./flowcap -max-export-per-cycle 20000 eth0
+sudo ./bin/flowcap -max-export-per-cycle 20000 eth0
 
 # JSON output for log collectors (Promtail, Filebeat, etc.)
-sudo ./flowcap -json wg0 | tee -a /var/log/flows.json
+sudo ./bin/flowcap -json wg0 | tee -a /var/log/flows.json
 
 # With statistics file for detailed logging
-sudo ./flowcap -stats-file /var/log/flowcap-stats.log wg0
+sudo ./bin/flowcap -stats-file /var/log/flowcap-stats.log wg0
 
 # Enable Prometheus metrics endpoint
-sudo ./flowcap -metrics-addr 127.0.0.1:9090 wg0
+sudo ./bin/flowcap -metrics-addr 127.0.0.1:9090 wg0
 
 # Print build version and exit
-./flowcap --version
+./bin/flowcap --version
 
 # Export every minute for low-traffic interfaces
-sudo ./flowcap -interval 60 -timeout 300 tun0
+sudo ./bin/flowcap -interval 60 -timeout 300 tun0
 ```
 
 At startup, flowcap logs the embedded version metadata together with the selected interface and runtime options.
@@ -249,7 +256,7 @@ Use `-stats-file` to log per-cycle statistics to a separate file. The format fol
 **Text (default):**
 
 ```bash
-sudo ./flowcap -stats-file /var/log/flowcap-stats.log wg0
+sudo ./bin/flowcap -stats-file /var/log/flowcap-stats.log wg0
 ```
 
 ```text
@@ -260,7 +267,7 @@ sudo ./flowcap -stats-file /var/log/flowcap-stats.log wg0
 **JSON (`-json` flag):**
 
 ```bash
-sudo ./flowcap -json -stats-file /var/log/flowcap-stats.log wg0
+sudo ./bin/flowcap -json -stats-file /var/log/flowcap-stats.log wg0
 ```
 
 ```json
