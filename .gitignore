@@ -20,10 +20,11 @@ profile.cov
 # Go workspace file
 go.work
 go.work.sum
-flowcap
+
+# Build artifacts
+bin/
+.cache/
 *.o
-flow_bpfel.go
-flow_bpfeb.go
 
 
 # Custom

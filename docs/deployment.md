@@ -11,7 +11,7 @@ useradd --system --no-create-home --home-dir /nonexistent --shell /usr/sbin/nolo
 Install the binary:
 
 ```bash
-sudo cp flowcap /usr/local/bin/
+sudo cp bin/flowcap /usr/local/bin/
 sudo chmod 755 /usr/local/bin/flowcap
 ```
 

@@ -11,31 +11,31 @@ repos:
     hooks:
       - id: golangci-lint
         name: golangci-lint
-        entry: golangci-lint run
+        entry: bash -c 'GOCACHE="$PWD/.cache/go-build" golangci-lint run'
         language: system
         pass_filenames: false
         types: [go]
       - id: go-vet
         name: go vet
-        entry: go vet ./...
+        entry: bash -c 'GOCACHE="$PWD/.cache/go-build" go vet ./...'
         language: system
         pass_filenames: false
         types: [go]
       - id: go-test
         name: go test
-        entry: go test ./...
+        entry: bash -c 'GOCACHE="$PWD/.cache/go-build" go test ./...'
         language: system
         pass_filenames: false
         types: [go]
       - id: go-mod-tidy
         name: go mod tidy
-        entry: bash -c 'go mod tidy && git diff --exit-code go.mod go.sum'
+        entry: bash -c 'GOCACHE="$PWD/.cache/go-build" go mod tidy && git diff --exit-code go.mod go.sum'
         language: system
         pass_filenames: false
         types: [go]
       - id: govulncheck
         name: govulncheck
-        entry: govulncheck ./...
+        entry: bash -c 'GOCACHE="$PWD/.cache/go-build" govulncheck ./...'
         language: system
         pass_filenames: false
         types: [go]
