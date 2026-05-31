@@ -1,3 +1,8 @@
+default_install_hook_types:
+  - pre-commit
+  - commit-msg
+  - pre-push
+
 repos:
   - repo: https://github.com/pre-commit/pre-commit-hooks
     rev: v6.0.0
@@ -5,7 +10,12 @@ repos:
       - id: trailing-whitespace
       - id: end-of-file-fixer
       - id: check-yaml
+      - id: check-added-large-files
       - id: check-merge-conflict
+      - id: detect-aws-credentials
+        args:
+          - --allow-missing-credentials
+      - id: detect-private-key
 
   - repo: local
     hooks:
@@ -38,6 +48,7 @@ repos:
         entry: bash -c 'GOCACHE="$PWD/.cache/go-build" govulncheck ./...'
         language: system
         pass_filenames: false
+        stages: [pre-push]
         types: [go]
 
   - repo: https://github.com/compilerla/conventional-pre-commit
