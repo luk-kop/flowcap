@@ -95,7 +95,7 @@ These tools are **complementary**: flowcap answers "who generates how much traff
 VPC Flow Logs capture network traffic at the ENI (Elastic Network Interface) level within an AWS VPC.
 
 - **Aggregation window:** 1 minute or 10 minutes (not configurable beyond these options)
-- **Flow key:** 5-tuple (src/dst IP, src/dst port, protocol) - same as flowcap
+- **Flow identity:** 5-tuple scoped to an ENI and aggregation interval, with an optional `flow-direction` field; Flowcap similarly adds the TCX observation direction to its 5-tuple key
 - **Metrics:** packets, bytes, action (ACCEPT/REJECT), log-status
 - **Destination:** CloudWatch Logs, S3, Kinesis Data Firehose
 - **Latency:** Minutes from capture to availability
@@ -106,7 +106,7 @@ VPC Flow Logs capture network traffic at the ENI (Elastic Network Interface) lev
 | **Environment** | Any Linux (bare metal, VM, container) | AWS VPC (ENI) only |
 | **Latency** | Seconds (default 10s) | 1-10 minutes |
 | **TCP flags** | Full per-flow flags | v5+ only (limited) |
-| **Flow lifecycle** | Smart: FIN/RST detection, inactivity timeout | Simple time window |
+| **Flow lifecycle** | Cumulative kernel counters, periodic deltas, FIN/RST and inactivity classification | Simple time window |
 | **Cost** | Free, minimal CPU overhead | Per GB ingested/stored |
 | **Configuration** | Full control (interval, timeout, max-flows) | Limited |
 | **Accept/Reject** | No - sees all traffic | Yes (security groups) |
