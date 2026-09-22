@@ -14,14 +14,19 @@ sudo ./bin/flowcap -metrics-addr 127.0.0.1:9090 wg0
 flowcap_build_info{version,revision,build_date} # Build metadata for the running binary
 flowcap_capture_info{interface,l2_header_bytes} # Capture target metadata
 flowcap_export_scan_flows                       # Flows observed during the last export scan
+flowcap_export_scan_complete                    # 1 if the last map scan completed, otherwise 0
+flowcap_export_iterator_duplicates_total        # Repeated flow-instance snapshots seen in a scan
+flowcap_export_last_success_timestamp_seconds  # Unix time of the last successful export cycle
 flowcap_exported_flows_total{reason="active"}   # Periodic snapshot exports
 flowcap_exported_flows_total{reason="inactive"} # Idle timeout exports
 flowcap_exported_flows_total{reason="closed"}   # Connection end exports (TCP FIN/RST)
 flowcap_exported_bytes_total                    # Total bytes exported
 flowcap_exported_packets_total                  # Total packets exported
+flowcap_export_errors_total{stage}              # Export failures: scan, state, encode, write
+flowcap_stats_errors_total{operation}           # Optional stats-file failures: write, sync
 flowcap_config_interval_seconds                 # Configured export interval
 flowcap_config_inactivity_timeout_seconds       # Configured inactivity timeout
-flowcap_config_max_flows                        # Configured max concurrent flows
+flowcap_config_max_flows                        # Configured retained flow capacity
 flowcap_config_max_export_per_cycle             # Configured max flows per export cycle
 flowcap_dropped_packets_total{reason="fragments"}   # Total dropped IP fragments
 flowcap_dropped_packets_total{reason="non_ipv4"}    # Total dropped non-IPv4 packets (IPv6, ARP, etc.)
@@ -29,6 +34,10 @@ flowcap_dropped_packets_total{reason="parse_error"} # Total dropped packets due 
 flowcap_dropped_packets_total{reason="linearize"}   # Total packets where header linearization failed
 flowcap_dropped_packets_total{reason="map_full"}    # Total packets lost due to flow map insert + retry failure
 ```
+
+The `exported_*` counters advance only after a complete flow record has been accepted by the output writer. They count exported deltas, not cumulative kernel values. A successful write does not guarantee that a downstream collector has persisted the record.
+
+`flowcap_export_errors_total` and `flowcap_stats_errors_total` are separate because failure of the optional statistics file does not invalidate a flow record already written to stdout. The map is a fixed-capacity HASH, so `reason="map_full"` counts packets whose new flow could not be inserted and whose retry lookup found no competing insertion.
 
 **Raw output example** (`curl http://127.0.0.1:9090/metrics`):
 
@@ -39,7 +48,7 @@ flowcap_config_interval_seconds 10
 # HELP flowcap_config_max_export_per_cycle Configured maximum flows to export per cycle
 # TYPE flowcap_config_max_export_per_cycle gauge
 flowcap_config_max_export_per_cycle 10000
-# HELP flowcap_config_max_flows Configured maximum number of concurrent flows
+# HELP flowcap_config_max_flows Configured maximum retained flow instances
 # TYPE flowcap_config_max_flows gauge
 flowcap_config_max_flows 16384
 # HELP flowcap_config_inactivity_timeout_seconds Configured flow inactivity timeout in seconds

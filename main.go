@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"sort"
 	"strconv"
 	"strings"
 	"syscall"
@@ -26,13 +27,25 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-//go:generate go run github.com/cilium/ebpf/cmd/bpf2go -go-package main -type flow_key -type flow_stats -cflags "-I/usr/include/$(uname -m)-linux-gnu" flow flowcap.c
+//go:generate go run github.com/cilium/ebpf/cmd/bpf2go -go-package main -type flow_key -type flow_stats -cflags "-mcpu=v3 -I/usr/include/$(uname -m)-linux-gnu" flow flowcap.c
 
 var (
 	// Prometheus metrics
 	exportScanFlows = prometheus.NewGauge(prometheus.GaugeOpts{
 		Name: "flowcap_export_scan_flows",
 		Help: "Number of flows observed during the last export scan",
+	})
+	exportScanComplete = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "flowcap_export_scan_complete",
+		Help: "Whether the last flow-map scan completed without an iterator error",
+	})
+	exportIteratorDuplicates = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "flowcap_export_iterator_duplicates_total",
+		Help: "Total repeated flow-instance snapshots observed within one map scan",
+	})
+	exportLastSuccess = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "flowcap_export_last_success_timestamp_seconds",
+		Help: "Unix time of the last successful flow export cycle",
 	})
 	exportedFlowsTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "flowcap_exported_flows_total",
@@ -46,6 +59,14 @@ var (
 		Name: "flowcap_exported_packets_total",
 		Help: "Total packets exported across all flows",
 	})
+	exportErrorsTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "flowcap_export_errors_total",
+		Help: "Total flow export errors by stage",
+	}, []string{"stage"}) // stage: scan, state, encode, write
+	statsErrorsTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "flowcap_stats_errors_total",
+		Help: "Total statistics file errors by operation",
+	}, []string{"operation"}) // operation: write, sync
 	configInterval = prometheus.NewGauge(prometheus.GaugeOpts{
 		Name: "flowcap_config_interval_seconds",
 		Help: "Configured flow export interval in seconds",
@@ -56,7 +77,7 @@ var (
 	})
 	configMaxFlows = prometheus.NewGauge(prometheus.GaugeOpts{
 		Name: "flowcap_config_max_flows",
-		Help: "Configured maximum number of concurrent flows",
+		Help: "Configured maximum retained flow instances",
 	})
 	configMaxExport = prometheus.NewGauge(prometheus.GaugeOpts{
 		Name: "flowcap_config_max_export_per_cycle",
@@ -78,9 +99,14 @@ var (
 
 func init() {
 	prometheus.MustRegister(exportScanFlows)
+	prometheus.MustRegister(exportScanComplete)
+	prometheus.MustRegister(exportIteratorDuplicates)
+	prometheus.MustRegister(exportLastSuccess)
 	prometheus.MustRegister(exportedFlowsTotal)
 	prometheus.MustRegister(exportedBytes)
 	prometheus.MustRegister(exportedPackets)
+	prometheus.MustRegister(exportErrorsTotal)
+	prometheus.MustRegister(statsErrorsTotal)
 	prometheus.MustRegister(configInterval)
 	prometheus.MustRegister(configInactivityTimeout)
 	prometheus.MustRegister(configMaxFlows)
@@ -101,13 +127,28 @@ const (
 	dropMax       = 5
 )
 
+const (
+	flowDirectionIngress uint8 = 0
+	flowDirectionEgress  uint8 = 1
+)
+
 var dropReasonLabels = [dropMax]string{"fragments", "non_ipv4", "parse_error", "linearize", "map_full"}
 
 var exportReasonLabels = [...]string{"active", "inactive", "closed"}
 
+var exportErrorStageLabels = [...]string{"scan", "state", "encode", "write"}
+
+var statsErrorOperationLabels = [...]string{"write", "sync"}
+
 func initMetricLabels() {
 	for _, reason := range exportReasonLabels {
 		exportedFlowsTotal.WithLabelValues(reason).Add(0)
+	}
+	for _, stage := range exportErrorStageLabels {
+		exportErrorsTotal.WithLabelValues(stage).Add(0)
+	}
+	for _, operation := range statsErrorOperationLabels {
+		statsErrorsTotal.WithLabelValues(operation).Add(0)
 	}
 	for _, reason := range dropReasonLabels {
 		droppedPacketsTotal.WithLabelValues(reason).Add(0)
@@ -120,6 +161,8 @@ var revision = "unknown"
 var buildDate = "unknown"
 
 func main() {
+	// Let EPIPE follow the same cleanup path as other output failures.
+	signal.Ignore(syscall.SIGPIPE)
 	os.Exit(run(os.Args[1:], os.Stdout, os.Stderr))
 }
 
@@ -131,14 +174,42 @@ func writeln(w io.Writer, args ...interface{}) {
 	_, _ = fmt.Fprintln(w, args...)
 }
 
+type timeoutWriter struct {
+	writer  io.Writer
+	timeout time.Duration
+}
+
+type writeDeadlineSetter interface {
+	SetWriteDeadline(time.Time) error
+}
+
+func (w timeoutWriter) Write(p []byte) (int, error) {
+	setter, supportsDeadline := w.writer.(writeDeadlineSetter)
+	if !supportsDeadline || w.timeout <= 0 {
+		return w.writer.Write(p)
+	}
+	if err := setter.SetWriteDeadline(time.Now().Add(w.timeout)); err != nil {
+		if errors.Is(err, os.ErrNoDeadline) {
+			return w.writer.Write(p)
+		}
+		return 0, fmt.Errorf("set output deadline: %w", err)
+	}
+	defer func() {
+		_ = setter.SetWriteDeadline(time.Time{})
+	}()
+	return w.writer.Write(p)
+}
+
 func run(args []string, stdout io.Writer, stderr io.Writer) int {
 	fs := flag.NewFlagSet("flowcap", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 
 	interval := fs.Int("interval", 10, "flow export interval in seconds")
 	timeout := fs.Int("timeout", 60, "flow inactivity timeout in seconds")
-	maxFlows := fs.Int("max-flows", 16384, "maximum number of concurrent flows")
+	maxFlows := fs.Int("max-flows", 16384, "maximum flow instances retained until shutdown")
 	maxExportPerCycle := fs.Int("max-export-per-cycle", 10000, "maximum flows to export per cycle")
+	outputTimeout := fs.Duration("output-timeout", 30*time.Second, "maximum duration of one flow output write when supported by the destination")
+	shutdownTimeout := fs.Duration("shutdown-timeout", 30*time.Second, "maximum duration of the shutdown procedure")
 	jsonOutput := fs.Bool("json", false, "output in JSON format")
 	metricsAddr := fs.String("metrics-addr", "", "enable Prometheus metrics HTTP server at host:port (e.g. 127.0.0.1:9090)")
 	statsFile := fs.String("stats-file", "", "optional file for detailed statistics logging")
@@ -196,8 +267,13 @@ func run(args []string, stdout io.Writer, stderr io.Writer) int {
 		writef(stderr, "max-export-per-cycle (%d) cannot exceed max-flows (%d)\n", *maxExportPerCycle, *maxFlows)
 		return 1
 	}
-	if *timeout < *interval {
-		log.Printf("Warning: timeout (%ds) is less than interval (%ds), flows may expire before export", *timeout, *interval)
+	if *outputTimeout <= 0 {
+		writef(stderr, "output-timeout must be greater than 0, got %s\n", *outputTimeout)
+		return 1
+	}
+	if *shutdownTimeout <= 0 {
+		writef(stderr, "shutdown-timeout must be greater than 0, got %s\n", *shutdownTimeout)
+		return 1
 	}
 	if *metricsAddr != "" {
 		host, port, err := net.SplitHostPort(*metricsAddr)
@@ -231,6 +307,15 @@ func run(args []string, stdout io.Writer, stderr io.Writer) int {
 	}
 	ifaceIndex := ifaceObj.Index
 
+	resources := &captureResources{}
+	handedOff := false
+	defer func() {
+		if !handedOff {
+			if err := resources.Close(); err != nil {
+				log.Printf("Startup cleanup failed: %v", err)
+			}
+		}
+	}()
 	// Open stats file if specified
 	var statsWriter *os.File
 	if *statsFile != "" {
@@ -240,11 +325,7 @@ func run(args []string, stdout io.Writer, stderr io.Writer) int {
 			writef(stderr, "Failed to open stats file: %v\n", err)
 			return 1
 		}
-		defer func() {
-			if err := statsWriter.Close(); err != nil {
-				log.Printf("Failed to close stats file: %v", err)
-			}
-		}()
+		resources.stats = statsWriter
 	}
 
 	if err := rlimit.RemoveMemlock(); err != nil {
@@ -276,43 +357,31 @@ func run(args []string, stdout io.Writer, stderr io.Writer) int {
 		writef(stderr, "Failed to load eBPF objects: %v\n", err)
 		return 1
 	}
-	defer func() {
-		if err := objs.Close(); err != nil {
-			log.Printf("Failed to close eBPF objects: %v", err)
-		}
-	}()
+	resources.objects = objs
 
 	// Attach to ingress (incoming packets)
 	linkIngress, err := link.AttachTCX(link.TCXOptions{
 		Interface: ifaceIndex,
-		Program:   objs.FlowCapture,
+		Program:   objs.FlowCaptureIngress,
 		Attach:    ebpf.AttachTCXIngress,
 	})
 	if err != nil {
 		writef(stderr, "Failed to attach TC ingress: %v\n", err)
 		return 1
 	}
-	defer func() {
-		if err := linkIngress.Close(); err != nil {
-			log.Printf("Failed to close TC ingress link: %v", err)
-		}
-	}()
+	resources.ingress = &captureHook{link: linkIngress}
 
 	// Attach to egress (outgoing packets)
 	linkEgress, err := link.AttachTCX(link.TCXOptions{
 		Interface: ifaceIndex,
-		Program:   objs.FlowCapture,
+		Program:   objs.FlowCaptureEgress,
 		Attach:    ebpf.AttachTCXEgress,
 	})
 	if err != nil {
 		writef(stderr, "Failed to attach TC egress: %v\n", err)
 		return 1
 	}
-	defer func() {
-		if err := linkEgress.Close(); err != nil {
-			log.Printf("Failed to close TC egress link: %v", err)
-		}
-	}()
+	resources.egress = &captureHook{link: linkEgress}
 
 	// Optionally start Prometheus metrics server
 	var metricsServer *http.Server
@@ -344,27 +413,34 @@ func run(args []string, stdout io.Writer, stderr io.Writer) int {
 	defer ticker.Stop()
 
 	exporter := &flowExporter{}
-
-	for {
-		select {
-		case <-ctx.Done():
-			log.Println("Shutting down...")
-			exporter.exportFlows(objs.Flows, objs.DropCounters, *timeout, *jsonOutput, *maxExportPerCycle, stdout, statsWriter)
-			if metricsServer != nil {
-				shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
-				if err := metricsServer.Shutdown(shutdownCtx); err != nil {
-					log.Printf("Metrics server shutdown error: %v", err)
-				}
-				shutdownCancel()
-			}
-			return 0
-		case err := <-metricsErrChan:
-			log.Printf("Metrics server failed: %v", err)
-			return 1
-		case <-ticker.C:
-			exporter.exportFlows(objs.Flows, objs.DropCounters, *timeout, *jsonOutput, *maxExportPerCycle, stdout, statsWriter)
+	flowOutput := timeoutWriter{writer: stdout, timeout: *outputTimeout}
+	export := func(maxRecords int) error {
+		if maxRecords == 0 {
+			return exporter.drainFlows(objs.Flows, objs.DropCounters, *timeout, *jsonOutput, flowOutput, statsWriter)
 		}
+		return exporter.exportFlows(objs.Flows, objs.DropCounters, *timeout, *jsonOutput, maxRecords, flowOutput, statsWriter)
 	}
+	cleanup := func(shutdownCtx context.Context) error {
+		var serverErr error
+		if metricsServer != nil {
+			serverErr = metricsServer.Shutdown(shutdownCtx)
+		}
+		return errors.Join(serverErr, resources.Close())
+	}
+	// Lifecycle owns resources even after a timeout. It closes them only after
+	// the worker has stopped. main exits on timeout; no map is closed under an
+	// outstanding lookup/write by a deferred cleanup in this goroutine.
+	handedOff = true
+	if err := runCapture(ctx, ticker.C, metricsErrChan, *maxExportPerCycle, *shutdownTimeout, export, resources.Stop, cleanup); err != nil {
+		var drainErr *incompleteDrainError
+		if errors.As(err, &drainErr) && drainErr.known {
+			log.Printf("Capture stopped with incomplete export/cleanup; %d records remain: %v", drainErr.remaining, err)
+		} else {
+			log.Printf("Capture stopped with incomplete export/cleanup; remaining records unknown: %v", err)
+		}
+		return 1
+	}
+	return 0
 }
 
 func startupLogLine(iface string, interval, timeout, maxFlows, maxExportPerCycle int, jsonOutput bool, metricsAddr, statsFile string) string {
@@ -441,21 +517,36 @@ func readDropCounters(dropMap *ebpf.Map) [dropMax]uint64 {
 	return totals
 }
 
-// exportFlows iterates over the eBPF flows map, exports each flow via
-// printFlow, and deletes it from the map. Flows are classified as active,
-// inactive (exceeded inactivityTimeout), or closed (TCP FIN/RST seen).
+// exportFlows iterates over the eBPF flows map and exports counter deltas since
+// the last confirmed write. Flows are classified as active, inactive (exceeded
+// inactivityTimeout), or closed (TCP FIN/RST seen).
 // At most maxExportPerCycle flows are exported per call to bound latency.
 // If statsWriter is non-nil, a summary line is appended to that file.
 
-// flowExporter holds state across export cycles. Must be used from a single
-// goroutine (the main ticker loop) — no synchronisation is provided.
+// flowExporter holds state across export cycles. The single export worker owns
+// it; no synchronization is provided for concurrent callers.
 type flowExporter struct {
 	prevDrops [dropMax]uint64
+	confirmed map[flowInstance]flowConfirmation
+	cursor    flowInstance
+	hasCursor bool
+}
+
+type flowInstance struct {
+	key        flowFlowKey
+	generation uint64
+}
+
+type flowConfirmation struct {
+	packets    uint64
+	bytes      uint64
+	observedAt uint64
 }
 
 type flowRecord struct {
-	key   flowFlowKey
-	stats flowFlowStats
+	key        flowFlowKey
+	stats      flowFlowStats
+	observedAt uint64
 }
 
 type exportSummary struct {
@@ -468,35 +559,80 @@ type exportSummary struct {
 	totalPackets  uint64
 	drops         [dropMax]uint64
 	rateLimited   bool
-	keysToDelete  []flowFlowKey
 }
 
-func (fe *flowExporter) exportFlows(flowMap *ebpf.Map, dropMap *ebpf.Map, timeoutSec int, jsonOutput bool, maxExportPerCycle int, output io.Writer, statsWriter *os.File) {
-	var key flowFlowKey
-	var stats flowFlowStats
-	iter := flowMap.Iterate()
+type exportJob struct {
+	maxRecords int
+	result     chan<- error
+}
 
-	var records []flowRecord
-	for iter.Next(&key, &stats) {
-		records = append(records, flowRecord{key: key, stats: stats})
+func startExportWorker(jobs <-chan exportJob, export func(maxRecords int) error) <-chan struct{} {
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for job := range jobs {
+			job.result <- export(job.maxRecords)
+		}
+	}()
+	return done
+}
+
+func exportFailurePreventsRetry(err error) bool {
+	var stageErr *exportStageError
+	return errors.As(err, &stageErr) && (stageErr.stage == "encode" || stageErr.stage == "write")
+}
+
+type exportStageError struct {
+	stage string
+	err   error
+}
+
+func (e *exportStageError) Error() string {
+	return fmt.Sprintf("%s: %v", e.stage, e.err)
+}
+
+func (e *exportStageError) Unwrap() error {
+	return e.err
+}
+
+func newExportStageError(stage string, err error) error {
+	if err == nil {
+		return nil
 	}
+	return &exportStageError{stage: stage, err: err}
+}
 
-	if err := iter.Err(); err != nil {
-		log.Printf("Error iterating flows: %v", err)
+func recordExportError(err error) {
+	var stageErr *exportStageError
+	if errors.As(err, &stageErr) {
+		exportErrorsTotal.WithLabelValues(stageErr.stage).Inc()
+	}
+}
+
+func (fe *flowExporter) exportFlows(flowMap *ebpf.Map, dropMap *ebpf.Map, timeoutSec int, jsonOutput bool, maxExportPerCycle int, output io.Writer, statsWriter *os.File) error {
+	records, err := scanFlowMap(flowMap)
+	if err != nil {
+		exportScanComplete.Set(0)
+		err = newExportStageError("scan", err)
+		recordExportError(err)
+		return err
+	}
+	exportScanComplete.Set(1)
+	if err := fe.pruneConfirmations(flowMap, records); err != nil {
+		err = newExportStageError("state", err)
+		recordExportError(err)
+		return err
+	}
+	uniqueFlows := fe.uniqueFlowCount(records)
+	if duplicates := len(records) - uniqueFlows; duplicates > 0 {
+		exportIteratorDuplicates.Add(float64(duplicates))
 	}
 
 	var statsOutput io.Writer
 	if statsWriter != nil {
 		statsOutput = statsWriter
 	}
-	summary := fe.exportRecords(records, readDropCounters(dropMap), ktimeNow(), timeoutSec, jsonOutput, maxExportPerCycle, output, statsOutput)
-
-	// Apply deferred deletes after iteration completes
-	for _, k := range summary.keysToDelete {
-		if err := flowMap.Delete(k); err != nil {
-			log.Printf("Error deleting flow: %v", err)
-		}
-	}
+	summary, exportErr := fe.exportRecords(records, readDropCounters(dropMap), ktimeNow(), timeoutSec, jsonOutput, maxExportPerCycle, output, statsOutput)
 
 	if summary.rateLimited {
 		log.Printf("Warning: Export rate limited at %d flows, %d total flows in map", maxExportPerCycle, summary.currentFlows)
@@ -504,39 +640,59 @@ func (fe *flowExporter) exportFlows(flowMap *ebpf.Map, dropMap *ebpf.Map, timeou
 
 	if statsWriter != nil {
 		if err := statsWriter.Sync(); err != nil {
+			statsErrorsTotal.WithLabelValues("sync").Inc()
 			log.Printf("Failed to sync stats file: %v", err)
 		}
 	}
+
+	if exportErr != nil {
+		recordExportError(exportErr)
+		return exportErr
+	}
+	exportLastSuccess.SetToCurrentTime()
+	return nil
 }
 
-func (fe *flowExporter) exportRecords(records []flowRecord, cumDrops [dropMax]uint64, now uint64, timeoutSec int, jsonOutput bool, maxExportPerCycle int, output io.Writer, statsWriter io.Writer) exportSummary {
+func (fe *flowExporter) exportRecords(records []flowRecord, cumDrops [dropMax]uint64, now uint64, timeoutSec int, jsonOutput bool, maxExportPerCycle int, output io.Writer, statsWriter io.Writer) (exportSummary, error) {
 	inactivityTimeout := uint64(timeoutSec) * uint64(time.Second)
-	summary := exportSummary{currentFlows: len(records)}
+	exportWallTime := time.Now().UTC()
+	fe.ensureState()
+	records = fe.orderRecords(records)
+	summary := exportSummary{currentFlows: fe.uniqueFlowCount(records)}
 
 	for _, record := range records {
-		if summary.exportedCount >= maxExportPerCycle {
-			summary.rateLimited = true
+		if record.stats.Packets == 0 {
 			continue
 		}
 
-		if record.stats.Packets == 0 {
-			// No new packets since flow was created by eBPF — should not
-			// happen in normal operation, but clean up defensively.
-			summary.keysToDelete = append(summary.keysToDelete, record.key)
+		instance := flowInstance{key: record.key, generation: flowGeneration(record.stats)}
+		observedAt := record.observedAt
+		if observedAt == 0 {
+			observedAt = now
+		}
+		delta, windowStart, hasDelta, err := fe.deltaFor(instance, record.stats, observedAt)
+		if err != nil {
+			return summary, newExportStageError("state", err)
+		}
+		if !hasDelta {
+			continue
+		}
+		if maxExportPerCycle > 0 && summary.exportedCount >= maxExportPerCycle {
+			summary.rateLimited = true
 			continue
 		}
 
 		inactive := now > record.stats.LastSeen && (now-record.stats.LastSeen) > inactivityTimeout
 		tcpFinished := (record.stats.TcpFlags&0x01) != 0 || (record.stats.TcpFlags&0x04) != 0 // FIN or RST
 
-		// Export and delete all scanned flows with packets. New packets from the
-		// same 5-tuple will create a fresh entry in the eBPF map with
-		// accurate timestamps (like NetFlow active timeout).
-		printFlowTo(output, record.key, record.stats, jsonOutput)
-		summary.keysToDelete = append(summary.keysToDelete, record.key)
+		if err := printFlowAt(output, record.key, delta, jsonOutput, windowStart, observedAt, now, exportWallTime); err != nil {
+			return summary, err
+		}
+		fe.confirmed[instance] = flowConfirmation{packets: record.stats.Packets, bytes: record.stats.Bytes, observedAt: observedAt}
+		fe.cursor, fe.hasCursor = instance, true
 		summary.exportedCount++
-		summary.totalBytes += record.stats.Bytes
-		summary.totalPackets += record.stats.Packets
+		summary.totalBytes += delta.Bytes
+		summary.totalPackets += delta.Packets
 
 		if tcpFinished {
 			summary.closedCount++
@@ -548,12 +704,12 @@ func (fe *flowExporter) exportRecords(records []flowRecord, cumDrops [dropMax]ui
 			summary.activeCount++
 			exportedFlowsTotal.WithLabelValues("active").Inc()
 		}
+		exportedBytes.Add(float64(delta.Bytes))
+		exportedPackets.Add(float64(delta.Packets))
 	}
 
 	// Update Prometheus metrics with the number of flows observed in this scan.
 	exportScanFlows.Set(float64(summary.currentFlows))
-	exportedBytes.Add(float64(summary.totalBytes))
-	exportedPackets.Add(float64(summary.totalPackets))
 
 	// Read and update drop counters (compute delta from previous cycle)
 	for i := 0; i < dropMax; i++ {
@@ -603,21 +759,156 @@ func (fe *flowExporter) exportRecords(records []flowRecord, cumDrops [dropMax]ui
 		}
 		if statsLine != "" {
 			if _, err := io.WriteString(statsWriter, statsLine); err != nil {
+				statsErrorsTotal.WithLabelValues("write").Inc()
 				log.Printf("Failed to write stats: %v", err)
 			}
 		}
 	}
 
-	return summary
+	return summary, nil
+}
+
+func flowGeneration(stats flowFlowStats) uint64 {
+	return stats.Generation
+}
+
+func (fe *flowExporter) ensureState() {
+	if fe.confirmed == nil {
+		fe.confirmed = make(map[flowInstance]flowConfirmation)
+	}
+}
+
+// A missed scan is never proof that an instance disappeared. A direct lookup
+// is required before discarding its acknowledgement. Production HASH entries
+// currently live until shutdown, so confirmations are bounded by map capacity.
+func (fe *flowExporter) pruneConfirmations(flowMap flowMapReader, records []flowRecord) error {
+	observed := make(map[flowInstance]bool, len(records))
+	for _, record := range records {
+		instance := flowInstance{key: record.key, generation: flowGeneration(record.stats)}
+		observed[instance] = true
+	}
+	for instance := range fe.confirmed {
+		if observed[instance] {
+			continue
+		}
+		var current flowFlowStats
+		err := flowMap.LookupWithFlags(&instance.key, &current, ebpf.LookupLock)
+		if errors.Is(err, ebpf.ErrKeyNotExist) || (err == nil && flowGeneration(current) != instance.generation) {
+			delete(fe.confirmed, instance)
+		} else if err != nil {
+			return fmt.Errorf("check retained confirmation: %w", err)
+		}
+	}
+	return nil
+}
+
+func instanceLess(a, b flowInstance) bool {
+	if a.generation != b.generation {
+		return a.generation < b.generation
+	}
+	if a.key.SrcIp != b.key.SrcIp {
+		return a.key.SrcIp < b.key.SrcIp
+	}
+	if a.key.DstIp != b.key.DstIp {
+		return a.key.DstIp < b.key.DstIp
+	}
+	if a.key.SrcPort != b.key.SrcPort {
+		return a.key.SrcPort < b.key.SrcPort
+	}
+	if a.key.DstPort != b.key.DstPort {
+		return a.key.DstPort < b.key.DstPort
+	}
+	if a.key.Protocol != b.key.Protocol {
+		return a.key.Protocol < b.key.Protocol
+	}
+	return a.key.FlowDirection < b.key.FlowDirection
+}
+
+// Rotate a stable ordering after the last confirmed instance. Busy flows at
+// the start of a hash walk cannot consume every cycle's budget forever.
+func (fe *flowExporter) orderRecords(input []flowRecord) []flowRecord {
+	records := append([]flowRecord(nil), input...)
+	identity := func(r flowRecord) flowInstance { return flowInstance{r.key, flowGeneration(r.stats)} }
+	sort.SliceStable(records, func(i, j int) bool { return instanceLess(identity(records[i]), identity(records[j])) })
+	if !fe.hasCursor {
+		return records
+	}
+	start := sort.Search(len(records), func(i int) bool { return instanceLess(fe.cursor, identity(records[i])) })
+	return append(records[start:len(records):len(records)], records[:start]...)
+}
+
+func (fe *flowExporter) uniqueFlowCount(records []flowRecord) int {
+	unique := make(map[flowInstance]struct{}, len(records))
+	for _, record := range records {
+		unique[flowInstance{key: record.key, generation: flowGeneration(record.stats)}] = struct{}{}
+	}
+	return len(unique)
+}
+
+func (fe *flowExporter) deltaFor(instance flowInstance, current flowFlowStats, observedAt uint64) (flowFlowStats, uint64, bool, error) {
+	previous, ok := fe.confirmed[instance]
+	if !ok {
+		windowStart := current.FirstSeen
+		if windowStart == 0 || windowStart > observedAt {
+			windowStart = observedAt
+		}
+		return current, windowStart, current.Packets != 0 || current.Bytes != 0, nil
+	}
+	if current.Packets < previous.packets || current.Bytes < previous.bytes {
+		return flowFlowStats{}, 0, false, fmt.Errorf(
+			"flow counters decreased without a generation change (generation=%d packets=%d->%d bytes=%d->%d)",
+			instance.generation, previous.packets, current.Packets, previous.bytes, current.Bytes,
+		)
+	}
+	delta := current
+	delta.Packets -= previous.packets
+	delta.Bytes -= previous.bytes
+	return delta, previous.observedAt, delta.Packets != 0 || delta.Bytes != 0, nil
 }
 
 // printFlow formats and prints a single flow record to stdout. Output is
 // either a JSON object or a human-readable one-liner depending on jsonOutput.
-func printFlow(key flowFlowKey, stats flowFlowStats, jsonOutput bool) {
-	printFlowTo(os.Stdout, key, stats, jsonOutput)
+func printFlow(key flowFlowKey, stats flowFlowStats, jsonOutput bool) error {
+	return printFlowTo(os.Stdout, key, stats, jsonOutput)
 }
 
-func printFlowTo(output io.Writer, key flowFlowKey, stats flowFlowStats, jsonOutput bool) {
+func printFlowTo(output io.Writer, key flowFlowKey, stats flowFlowStats, jsonOutput bool) error {
+	now := ktimeNow()
+	return printFlowAt(output, key, stats, jsonOutput, stats.FirstSeen, now, now, time.Now().UTC())
+}
+
+type jsonFlowRecord struct {
+	Generation    uint64  `json:"generation"`
+	WindowStart   string  `json:"window_start"`
+	WindowEnd     string  `json:"window_end"`
+	FirstSeen     string  `json:"first_seen"`
+	LastSeen      string  `json:"last_seen"`
+	ExportTime    string  `json:"export_time"`
+	SrcIP         string  `json:"src_ip"`
+	SrcPort       uint16  `json:"src_port"`
+	DstIP         string  `json:"dst_ip"`
+	DstPort       uint16  `json:"dst_port"`
+	Protocol      uint8   `json:"protocol"`
+	FlowDirection string  `json:"flow_direction"`
+	Packets       uint64  `json:"packets"`
+	Bytes         uint64  `json:"bytes"`
+	DurationNS    uint64  `json:"duration_ns"`
+	DurationSec   float64 `json:"duration_sec"`
+	TCPFlags      string  `json:"tcp_flags"`
+}
+
+func flowDirectionName(direction uint8) string {
+	switch direction {
+	case flowDirectionIngress:
+		return "ingress"
+	case flowDirectionEgress:
+		return "egress"
+	default:
+		return "unknown"
+	}
+}
+
+func printFlowAt(output io.Writer, key flowFlowKey, stats flowFlowStats, jsonOutput bool, windowStart, windowEnd, referenceMono uint64, referenceWall time.Time) error {
 	srcIP := net.IP(binary.NativeEndian.AppendUint32(nil, key.SrcIp))
 	dstIP := net.IP(binary.NativeEndian.AppendUint32(nil, key.DstIp))
 	var duration time.Duration
@@ -630,30 +921,52 @@ func printFlowTo(output io.Writer, key flowFlowKey, stats flowFlowStats, jsonOut
 		if stats.LastSeen >= stats.FirstSeen {
 			durationNs = stats.LastSeen - stats.FirstSeen
 		}
-		record := map[string]interface{}{
-			"timestamp":    time.Now().Unix(),
-			"src_ip":       srcIP.String(),
-			"src_port":     key.SrcPort,
-			"dst_ip":       dstIP.String(),
-			"dst_port":     key.DstPort,
-			"protocol":     key.Protocol,
-			"packets":      stats.Packets,
-			"bytes":        stats.Bytes,
-			"duration_ns":  durationNs,
-			"duration_sec": duration.Seconds(),
-			"tcp_flags":    fmt.Sprintf("0x%02x", stats.TcpFlags),
+		record := jsonFlowRecord{
+			Generation:    stats.Generation,
+			WindowStart:   monotonicWallTime(windowStart, referenceMono, referenceWall).Format(time.RFC3339Nano),
+			WindowEnd:     monotonicWallTime(windowEnd, referenceMono, referenceWall).Format(time.RFC3339Nano),
+			FirstSeen:     monotonicWallTime(stats.FirstSeen, referenceMono, referenceWall).Format(time.RFC3339Nano),
+			LastSeen:      monotonicWallTime(stats.LastSeen, referenceMono, referenceWall).Format(time.RFC3339Nano),
+			ExportTime:    referenceWall.Format(time.RFC3339Nano),
+			SrcIP:         srcIP.String(),
+			SrcPort:       key.SrcPort,
+			DstIP:         dstIP.String(),
+			DstPort:       key.DstPort,
+			Protocol:      key.Protocol,
+			FlowDirection: flowDirectionName(key.FlowDirection),
+			Packets:       stats.Packets,
+			Bytes:         stats.Bytes,
+			DurationNS:    durationNs,
+			DurationSec:   duration.Seconds(),
+			TCPFlags:      fmt.Sprintf("0x%02x", stats.TcpFlags),
 		}
 		data, err := json.Marshal(record)
 		if err != nil {
-			log.Printf("JSON marshal error: %v", err)
-			return
+			return newExportStageError("encode", err)
 		}
-		writeln(output, string(data))
+		if _, err := fmt.Fprintln(output, string(data)); err != nil {
+			return newExportStageError("write", err)
+		}
 	} else {
-		writef(output, "%s:%d -> %s:%d proto=%d packets=%d bytes=%d duration=%v flags=0x%02x\n",
+		if _, err := fmt.Fprintf(output, "%s:%d -> %s:%d proto=%d direction=%s generation=%d packets=%d bytes=%d duration=%v first_seen=%s last_seen=%s window_start=%s window_end=%s export_time=%s flags=0x%02x\n",
 			srcIP, key.SrcPort, dstIP, key.DstPort, key.Protocol,
-			stats.Packets, stats.Bytes, duration, stats.TcpFlags)
+			flowDirectionName(key.FlowDirection), stats.Generation, stats.Packets, stats.Bytes, duration,
+			monotonicWallTime(stats.FirstSeen, referenceMono, referenceWall).Format(time.RFC3339Nano),
+			monotonicWallTime(stats.LastSeen, referenceMono, referenceWall).Format(time.RFC3339Nano),
+			monotonicWallTime(windowStart, referenceMono, referenceWall).Format(time.RFC3339Nano),
+			monotonicWallTime(windowEnd, referenceMono, referenceWall).Format(time.RFC3339Nano),
+			referenceWall.Format(time.RFC3339Nano), stats.TcpFlags); err != nil {
+			return newExportStageError("write", err)
+		}
 	}
+	return nil
+}
+
+func monotonicWallTime(value, referenceMono uint64, referenceWall time.Time) time.Time {
+	if value >= referenceMono {
+		return referenceWall.Add(time.Duration(value - referenceMono))
+	}
+	return referenceWall.Add(-time.Duration(referenceMono - value))
 }
 
 // findInterface looks up a network interface by name and returns it. Logs a

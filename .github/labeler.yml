@@ -21,3 +21,8 @@ Go:
           - '**/*.go'
           - go.mod
           - go.sum
+
+Test:
+  - changed-files:
+      - any-glob-to-any-file:
+          - '**/*_test.go'

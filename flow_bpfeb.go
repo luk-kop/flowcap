@@ -14,23 +14,42 @@ import (
 )
 
 type flowFlowKey struct {
-	_        structs.HostLayout
-	SrcIp    uint32
-	DstIp    uint32
-	SrcPort  uint16
-	DstPort  uint16
-	Protocol uint8
-	Pad      [3]uint8
+	_             structs.HostLayout
+	SrcIp         uint32
+	DstIp         uint32
+	SrcPort       uint16
+	DstPort       uint16
+	Protocol      uint8
+	FlowDirection uint8
+	Pad           [2]uint8
 }
 
 type flowFlowStats struct {
-	_         structs.HostLayout
-	Packets   uint64
-	Bytes     uint64
-	FirstSeen uint64
-	LastSeen  uint64
-	TcpFlags  uint64
+	_    structs.HostLayout
+	Lock struct {
+		_   structs.HostLayout
+		Val uint32
+	}
+	Pad        uint32
+	Generation uint64
+	Packets    uint64
+	Bytes      uint64
+	FirstSeen  uint64
+	LastSeen   uint64
+	TcpFlags   uint64
 }
+
+// Names of all BPF objects in the ELF.
+//
+// Used for safe lookups in a Collection or CollectionSpec.
+const (
+	flowMapDropCounters        = "drop_counters"
+	flowMapFlowGeneration      = "flow_generation"
+	flowMapFlows               = "flows"
+	flowProgFlowCaptureEgress  = "flow_capture_egress"
+	flowProgFlowCaptureIngress = "flow_capture_ingress"
+	flowVarL2HdrLen            = "l2_hdr_len"
+)
 
 // loadFlow returns the embedded CollectionSpec for flow.
 func loadFlow() (*ebpf.CollectionSpec, error) {
@@ -52,7 +71,7 @@ func loadFlow() (*ebpf.CollectionSpec, error) {
 //	*flowMaps
 //
 // See ebpf.CollectionSpec.LoadAndAssign documentation for details.
-func loadFlowObjects(obj interface{}, opts *ebpf.CollectionOptions) error {
+func loadFlowObjects(obj any, opts *ebpf.CollectionOptions) error {
 	spec, err := loadFlow()
 	if err != nil {
 		return err
@@ -74,15 +93,17 @@ type flowSpecs struct {
 //
 // It can be passed ebpf.CollectionSpec.Assign.
 type flowProgramSpecs struct {
-	FlowCapture *ebpf.ProgramSpec `ebpf:"flow_capture"`
+	FlowCaptureEgress  *ebpf.ProgramSpec `ebpf:"flow_capture_egress"`
+	FlowCaptureIngress *ebpf.ProgramSpec `ebpf:"flow_capture_ingress"`
 }
 
 // flowMapSpecs contains maps before they are loaded into the kernel.
 //
 // It can be passed ebpf.CollectionSpec.Assign.
 type flowMapSpecs struct {
-	DropCounters *ebpf.MapSpec `ebpf:"drop_counters"`
-	Flows        *ebpf.MapSpec `ebpf:"flows"`
+	DropCounters   *ebpf.MapSpec `ebpf:"drop_counters"`
+	FlowGeneration *ebpf.MapSpec `ebpf:"flow_generation"`
+	Flows          *ebpf.MapSpec `ebpf:"flows"`
 }
 
 // flowVariableSpecs contains global variables before they are loaded into the kernel.
@@ -112,13 +133,15 @@ func (o *flowObjects) Close() error {
 //
 // It can be passed to loadFlowObjects or ebpf.CollectionSpec.LoadAndAssign.
 type flowMaps struct {
-	DropCounters *ebpf.Map `ebpf:"drop_counters"`
-	Flows        *ebpf.Map `ebpf:"flows"`
+	DropCounters   *ebpf.Map `ebpf:"drop_counters"`
+	FlowGeneration *ebpf.Map `ebpf:"flow_generation"`
+	Flows          *ebpf.Map `ebpf:"flows"`
 }
 
 func (m *flowMaps) Close() error {
 	return _FlowClose(
 		m.DropCounters,
+		m.FlowGeneration,
 		m.Flows,
 	)
 }
@@ -134,12 +157,14 @@ type flowVariables struct {
 //
 // It can be passed to loadFlowObjects or ebpf.CollectionSpec.LoadAndAssign.
 type flowPrograms struct {
-	FlowCapture *ebpf.Program `ebpf:"flow_capture"`
+	FlowCaptureEgress  *ebpf.Program `ebpf:"flow_capture_egress"`
+	FlowCaptureIngress *ebpf.Program `ebpf:"flow_capture_ingress"`
 }
 
 func (p *flowPrograms) Close() error {
 	return _FlowClose(
-		p.FlowCapture,
+		p.FlowCaptureEgress,
+		p.FlowCaptureIngress,
 	)
 }
 

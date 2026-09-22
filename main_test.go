@@ -3,16 +3,61 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"io"
 	"net"
 	"os"
 	"strings"
 	"testing"
 	"time"
+	"unsafe"
 
 	"github.com/prometheus/client_golang/prometheus"
 	dto "github.com/prometheus/client_model/go"
 )
+
+func mustPrintFlow(t *testing.T, key flowFlowKey, stats flowFlowStats, jsonOutput bool) {
+	t.Helper()
+	if err := printFlow(key, stats, jsonOutput); err != nil {
+		t.Fatalf("printFlow: %v", err)
+	}
+}
+
+var errTestWrite = errors.New("test write failure")
+
+type failOnCallWriter struct {
+	buf      bytes.Buffer
+	calls    int
+	failCall int
+	partial  bool
+}
+
+type deadlineRecordingWriter struct {
+	deadlines []time.Time
+	buf       bytes.Buffer
+}
+
+func (w *deadlineRecordingWriter) SetWriteDeadline(deadline time.Time) error {
+	w.deadlines = append(w.deadlines, deadline)
+	return nil
+}
+
+func (w *deadlineRecordingWriter) Write(p []byte) (int, error) {
+	return w.buf.Write(p)
+}
+
+func (w *failOnCallWriter) Write(p []byte) (int, error) {
+	w.calls++
+	if w.calls != w.failCall {
+		return w.buf.Write(p)
+	}
+	if !w.partial || len(p) == 0 {
+		return 0, errTestWrite
+	}
+	n := len(p) / 2
+	_, _ = w.buf.Write(p[:n])
+	return n, errTestWrite
+}
 
 // captureStdout runs fn and returns whatever it wrote to os.Stdout.
 func captureStdout(t *testing.T, fn func()) string {
@@ -45,11 +90,12 @@ func captureStdout(t *testing.T, fn func()) string {
 
 func TestPrintFlowText_IPv4(t *testing.T) {
 	key := flowFlowKey{
-		SrcIp:    0x0100007f, // 127.0.0.1 in LE
-		DstIp:    0x0800007f, // 127.0.0.8 in LE
-		SrcPort:  12345,
-		DstPort:  80,
-		Protocol: 6, // TCP
+		SrcIp:         0x0100007f, // 127.0.0.1 in LE
+		DstIp:         0x0800007f, // 127.0.0.8 in LE
+		SrcPort:       12345,
+		DstPort:       80,
+		Protocol:      6, // TCP
+		FlowDirection: flowDirectionEgress,
 	}
 	stats := flowFlowStats{
 		Packets:   10,
@@ -60,7 +106,7 @@ func TestPrintFlowText_IPv4(t *testing.T) {
 	}
 
 	out := captureStdout(t, func() {
-		printFlow(key, stats, false)
+		mustPrintFlow(t, key, stats, false)
 	})
 
 	if !strings.Contains(out, "127.0.0.1:12345") {
@@ -71,6 +117,9 @@ func TestPrintFlowText_IPv4(t *testing.T) {
 	}
 	if !strings.Contains(out, "proto=6") {
 		t.Errorf("expected proto=6, got: %s", out)
+	}
+	if !strings.Contains(out, "direction=egress") {
+		t.Errorf("expected direction=egress, got: %s", out)
 	}
 	if !strings.Contains(out, "packets=10") {
 		t.Errorf("expected packets=10, got: %s", out)
@@ -85,11 +134,12 @@ func TestPrintFlowText_IPv4(t *testing.T) {
 
 func TestPrintFlowJSON_IPv4(t *testing.T) {
 	key := flowFlowKey{
-		SrcIp:    0x0100007f,
-		DstIp:    0x0800007f,
-		SrcPort:  12345,
-		DstPort:  80,
-		Protocol: 6,
+		SrcIp:         0x0100007f,
+		DstIp:         0x0800007f,
+		SrcPort:       12345,
+		DstPort:       80,
+		Protocol:      6,
+		FlowDirection: flowDirectionIngress,
 	}
 	stats := flowFlowStats{
 		Packets:   10,
@@ -100,7 +150,7 @@ func TestPrintFlowJSON_IPv4(t *testing.T) {
 	}
 
 	out := captureStdout(t, func() {
-		printFlow(key, stats, true)
+		mustPrintFlow(t, key, stats, true)
 	})
 
 	var record map[string]interface{}
@@ -119,6 +169,30 @@ func TestPrintFlowJSON_IPv4(t *testing.T) {
 	}
 	if record["dst_port"].(float64) != 80 {
 		t.Errorf("expected dst_port 80, got %v", record["dst_port"])
+	}
+	if record["flow_direction"] != "ingress" {
+		t.Errorf("expected flow_direction ingress, got %v", record["flow_direction"])
+	}
+}
+
+func TestFlowDirectionName(t *testing.T) {
+	for _, tc := range []struct {
+		value uint8
+		want  string
+	}{
+		{flowDirectionIngress, "ingress"},
+		{flowDirectionEgress, "egress"},
+		{2, "unknown"},
+	} {
+		if got := flowDirectionName(tc.value); got != tc.want {
+			t.Errorf("flowDirectionName(%d)=%q, want %q", tc.value, got, tc.want)
+		}
+	}
+}
+
+func TestFlowKeyRemainsSixteenBytes(t *testing.T) {
+	if size := unsafe.Sizeof(flowFlowKey{}); size != 16 {
+		t.Fatalf("flow key size=%d, want 16", size)
 	}
 }
 
@@ -139,7 +213,7 @@ func TestPrintFlow_UDP(t *testing.T) {
 	}
 
 	out := captureStdout(t, func() {
-		printFlow(key, stats, false)
+		mustPrintFlow(t, key, stats, false)
 	})
 
 	if !strings.Contains(out, "proto=17") {
@@ -184,7 +258,7 @@ func TestPrintFlow_TCPFlags(t *testing.T) {
 			}
 
 			out := captureStdout(t, func() {
-				printFlow(key, stats, false)
+				mustPrintFlow(t, key, stats, false)
 			})
 
 			if !strings.Contains(out, "flags="+tt.expected) {
@@ -211,7 +285,7 @@ func TestPrintFlow_ZeroPackets(t *testing.T) {
 	}
 
 	out := captureStdout(t, func() {
-		printFlow(key, stats, false)
+		mustPrintFlow(t, key, stats, false)
 	})
 
 	if !strings.Contains(out, "packets=0") {
@@ -239,7 +313,7 @@ func TestPrintFlow_Duration(t *testing.T) {
 	}
 
 	out := captureStdout(t, func() {
-		printFlow(key, stats, false)
+		mustPrintFlow(t, key, stats, false)
 	})
 
 	if !strings.Contains(out, "duration=10s") {
@@ -264,7 +338,7 @@ func TestPrintFlowJSON_AllFields(t *testing.T) {
 	}
 
 	out := captureStdout(t, func() {
-		printFlow(key, stats, true)
+		mustPrintFlow(t, key, stats, true)
 	})
 
 	var record map[string]interface{}
@@ -284,14 +358,50 @@ func TestPrintFlowJSON_AllFields(t *testing.T) {
 	if record["tcp_flags"] != "0x18" {
 		t.Errorf("expected tcp_flags 0x18, got %v", record["tcp_flags"])
 	}
-	if _, ok := record["timestamp"]; !ok {
-		t.Error("expected timestamp field")
+	for _, field := range []string{"generation", "window_start", "window_end", "first_seen", "last_seen", "export_time", "flow_direction"} {
+		if _, ok := record[field]; !ok {
+			t.Errorf("expected %s field", field)
+		}
+	}
+	if _, ok := record["timestamp"]; ok {
+		t.Error("legacy timestamp field must not be present")
 	}
 	if _, ok := record["duration_ns"]; !ok {
 		t.Error("expected duration_ns field")
 	}
 	if _, ok := record["duration_sec"]; !ok {
 		t.Error("expected duration_sec field")
+	}
+}
+
+func TestPrintFlowAtUsesMonotonicReferenceForTimestamps(t *testing.T) {
+	key := flowFlowKey{SrcIp: 0x0100007f, DstIp: 0x0800007f, SrcPort: 443, DstPort: 54321, Protocol: 6}
+	stats := flowFlowStats{
+		Generation: 9,
+		Packets:    3,
+		Bytes:      450,
+		FirstSeen:  uint64(8 * time.Second),
+		LastSeen:   uint64(9 * time.Second),
+		TcpFlags:   0x18,
+	}
+	referenceWall := time.Date(2026, 9, 10, 12, 0, 0, 0, time.UTC)
+	var output bytes.Buffer
+
+	if err := printFlowAt(&output, key, stats, true, uint64(7*time.Second), uint64(10*time.Second), uint64(10*time.Second), referenceWall); err != nil {
+		t.Fatalf("printFlowAt: %v", err)
+	}
+	var record jsonFlowRecord
+	if err := json.Unmarshal(output.Bytes(), &record); err != nil {
+		t.Fatalf("decode output: %v", err)
+	}
+	if record.Generation != 9 {
+		t.Fatalf("expected generation 9, got %d", record.Generation)
+	}
+	if record.WindowStart != "2026-09-10T11:59:57Z" || record.WindowEnd != "2026-09-10T12:00:00Z" {
+		t.Fatalf("unexpected window: %s - %s", record.WindowStart, record.WindowEnd)
+	}
+	if record.FirstSeen != "2026-09-10T11:59:58Z" || record.LastSeen != "2026-09-10T11:59:59Z" || record.ExportTime != "2026-09-10T12:00:00Z" {
+		t.Fatalf("unexpected event timestamps: first=%s last=%s export=%s", record.FirstSeen, record.LastSeen, record.ExportTime)
 	}
 }
 
@@ -458,6 +568,28 @@ func TestRunRejectsInvalidMetricsAddr(t *testing.T) {
 	}
 }
 
+func TestRunRejectsNonPositiveTimeouts(t *testing.T) {
+	tests := []struct {
+		name string
+		args []string
+		want string
+	}{
+		{name: "output timeout", args: []string{"-output-timeout=0s", "lo"}, want: "output-timeout must be greater than 0"},
+		{name: "shutdown timeout", args: []string{"-shutdown-timeout=-1s", "lo"}, want: "shutdown-timeout must be greater than 0"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var stdout, stderr bytes.Buffer
+			if code := run(tt.args, &stdout, &stderr); code != 1 {
+				t.Fatalf("expected exit code 1, got %d", code)
+			}
+			if !strings.Contains(stderr.String(), tt.want) {
+				t.Fatalf("expected %q, got %q", tt.want, stderr.String())
+			}
+		})
+	}
+}
+
 func TestStartupLogLineIncludesVersionMetadata(t *testing.T) {
 	oldVersion, oldRevision, oldBuildDate := version, revision, buildDate
 	version, revision, buildDate = "v-test", "abc123", "2026-05-17T12:00:00Z"
@@ -550,7 +682,10 @@ func TestExportRecordsRateLimit(t *testing.T) {
 	closedBefore := counterValue(t, "closed")
 	inactiveBefore := counterValue(t, "inactive")
 
-	summary := fe.exportRecords(records, cumDrops, uint64(10*time.Second), 5, false, 2, &output, &stats)
+	summary, err := fe.exportRecords(records, cumDrops, uint64(10*time.Second), 5, false, 2, &output, &stats)
+	if err != nil {
+		t.Fatalf("exportRecords: %v", err)
+	}
 
 	if !summary.rateLimited {
 		t.Fatal("expected rateLimited=true")
@@ -560,9 +695,6 @@ func TestExportRecordsRateLimit(t *testing.T) {
 	}
 	if summary.exportedCount != 2 {
 		t.Fatalf("expected exportedCount=2, got %d", summary.exportedCount)
-	}
-	if len(summary.keysToDelete) != 2 {
-		t.Fatalf("expected 2 keys to delete, got %d", len(summary.keysToDelete))
 	}
 	if summary.activeCount != 1 || summary.closedCount != 1 || summary.inactiveCount != 0 {
 		t.Fatalf("unexpected classifications: active=%d closed=%d inactive=%d", summary.activeCount, summary.closedCount, summary.inactiveCount)
@@ -601,7 +733,10 @@ func TestExportRecordsDropCounterReset(t *testing.T) {
 	}
 	var output, stats bytes.Buffer
 
-	summary := fe.exportRecords(nil, cumDrops, uint64(10*time.Second), 5, false, 10, &output, &stats)
+	summary, err := fe.exportRecords(nil, cumDrops, uint64(10*time.Second), 5, false, 10, &output, &stats)
+	if err != nil {
+		t.Fatalf("exportRecords: %v", err)
+	}
 
 	if summary.drops[dropFragments] != 2 {
 		t.Fatalf("expected fragments drop delta after reset=2, got %d", summary.drops[dropFragments])
@@ -620,13 +755,211 @@ func TestExportRecordsDoesNotTreatTypedNilStatsFileAsWriter(t *testing.T) {
 		statsWriter = statsFile
 	}
 
-	summary := fe.exportRecords(nil, [dropMax]uint64{}, uint64(10*time.Second), 5, true, 10, &output, statsWriter)
+	summary, err := fe.exportRecords(nil, [dropMax]uint64{}, uint64(10*time.Second), 5, true, 10, &output, statsWriter)
+	if err != nil {
+		t.Fatalf("exportRecords: %v", err)
+	}
 
 	if summary.currentFlows != 0 {
 		t.Fatalf("expected no records, got %d", summary.currentFlows)
 	}
 	if output.Len() != 0 {
 		t.Fatalf("expected empty output, got %q", output.String())
+	}
+}
+
+func TestExportRecordsStatsFailureIsIndependentFromFlowOutput(t *testing.T) {
+	fe := &flowExporter{}
+	var output bytes.Buffer
+	stats := &failOnCallWriter{failCall: 1}
+	before := counterVecValue(t, statsErrorsTotal, "write")
+
+	summary, err := fe.exportRecords([]flowRecord{{
+		key:   flowFlowKey{SrcPort: 1000, DstPort: 80, Protocol: 6},
+		stats: flowFlowStats{Generation: 1, Packets: 2, Bytes: 200, FirstSeen: 1, LastSeen: 2},
+	}}, [dropMax]uint64{}, 3, 60, false, 10, &output, stats)
+	if err != nil {
+		t.Fatalf("stats failure must not fail flow export: %v", err)
+	}
+	if summary.exportedCount != 1 || output.Len() == 0 {
+		t.Fatalf("flow record was not confirmed: summary=%+v output=%q", summary, output.String())
+	}
+	if got := counterVecValue(t, statsErrorsTotal, "write") - before; got != 1 {
+		t.Fatalf("expected stats write error counter +1, got %v", got)
+	}
+}
+
+func TestExportRecordsStopsAfterWriteError(t *testing.T) {
+	fe := &flowExporter{}
+	records := []flowRecord{
+		{key: flowFlowKey{SrcPort: 1000, DstPort: 80, Protocol: 6}, stats: flowFlowStats{Packets: 2, Bytes: 200, FirstSeen: 1, LastSeen: 2}},
+		{key: flowFlowKey{SrcPort: 2000, DstPort: 80, Protocol: 6}, stats: flowFlowStats{Packets: 3, Bytes: 300, FirstSeen: 1, LastSeen: 2}},
+		{key: flowFlowKey{SrcPort: 3000, DstPort: 80, Protocol: 6}, stats: flowFlowStats{Packets: 4, Bytes: 400, FirstSeen: 1, LastSeen: 2}},
+	}
+	output := &failOnCallWriter{failCall: 2}
+
+	summary, err := fe.exportRecords(records, [dropMax]uint64{}, 3, 60, false, len(records), output, nil)
+	if !errors.Is(err, errTestWrite) {
+		t.Fatalf("expected write error, got %v", err)
+	}
+	var stageErr *exportStageError
+	if !errors.As(err, &stageErr) || stageErr.stage != "write" {
+		t.Fatalf("expected write stage error, got %v", err)
+	}
+	if output.calls != 2 {
+		t.Fatalf("expected exporter to stop after second write, got %d calls", output.calls)
+	}
+	if summary.exportedCount != 1 || summary.totalPackets != 2 || summary.totalBytes != 200 {
+		t.Fatalf("unexpected confirmed summary: %+v", summary)
+	}
+	firstInstance := flowInstance{key: records[0].key, generation: flowGeneration(records[0].stats)}
+	if got := fe.confirmed[firstInstance]; got != (flowConfirmation{packets: 2, bytes: 200, observedAt: 3}) {
+		t.Fatalf("only the first record should be confirmed, got %+v", got)
+	}
+	secondInstance := flowInstance{key: records[1].key, generation: flowGeneration(records[1].stats)}
+	if _, ok := fe.confirmed[secondInstance]; ok {
+		t.Fatal("failed record must not be confirmed")
+	}
+}
+
+func TestExportRecordsRejectsPartialWrite(t *testing.T) {
+	fe := &flowExporter{}
+	record := flowRecord{
+		key:   flowFlowKey{SrcPort: 1000, DstPort: 80, Protocol: 6},
+		stats: flowFlowStats{Packets: 2, Bytes: 200, FirstSeen: 1, LastSeen: 2},
+	}
+	output := &failOnCallWriter{failCall: 1, partial: true}
+
+	summary, err := fe.exportRecords([]flowRecord{record}, [dropMax]uint64{}, 3, 60, true, 1, output, nil)
+	if !errors.Is(err, errTestWrite) {
+		t.Fatalf("expected partial write error, got %v", err)
+	}
+	if summary.exportedCount != 0 || summary.totalPackets != 0 || summary.totalBytes != 0 {
+		t.Fatalf("partially written record must not be confirmed: %+v", summary)
+	}
+	instance := flowInstance{key: record.key, generation: flowGeneration(record.stats)}
+	if _, ok := fe.confirmed[instance]; ok {
+		t.Fatal("partially written record must not update confirmation state")
+	}
+}
+
+func TestTimeoutWriterSetsAndClearsDeadline(t *testing.T) {
+	destination := &deadlineRecordingWriter{}
+	writer := timeoutWriter{writer: destination, timeout: time.Second}
+
+	if _, err := writer.Write([]byte("record")); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	if destination.buf.String() != "record" {
+		t.Fatalf("unexpected output %q", destination.buf.String())
+	}
+	if len(destination.deadlines) != 2 || destination.deadlines[0].IsZero() || !destination.deadlines[1].IsZero() {
+		t.Fatalf("expected set and clear deadlines, got %v", destination.deadlines)
+	}
+}
+
+func TestExportWorkerProcessesOneJobAtATime(t *testing.T) {
+	jobs := make(chan exportJob, 2)
+	firstStarted := make(chan struct{})
+	secondStarted := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	done := startExportWorker(jobs, func(maxRecords int) error {
+		if maxRecords == 1 {
+			close(firstStarted)
+			<-releaseFirst
+		} else {
+			close(secondStarted)
+		}
+		return nil
+	})
+	firstResult := make(chan error, 1)
+	secondResult := make(chan error, 1)
+	jobs <- exportJob{maxRecords: 1, result: firstResult}
+	jobs <- exportJob{maxRecords: 2, result: secondResult}
+	<-firstStarted
+
+	select {
+	case <-secondStarted:
+		t.Fatal("second export started before the first completed")
+	default:
+	}
+	close(releaseFirst)
+	if err := <-firstResult; err != nil {
+		t.Fatalf("first export: %v", err)
+	}
+	if err := <-secondResult; err != nil {
+		t.Fatalf("second export: %v", err)
+	}
+	close(jobs)
+	<-done
+}
+
+func TestExportRecordsExportsOnlyConfirmedDelta(t *testing.T) {
+	fe := &flowExporter{}
+	key := flowFlowKey{SrcPort: 1000, DstPort: 80, Protocol: 6}
+	first := flowRecord{key: key, stats: flowFlowStats{Generation: 7, Packets: 10, Bytes: 1000, FirstSeen: 1, LastSeen: 2}}
+	second := flowRecord{key: key, stats: flowFlowStats{Generation: 7, Packets: 13, Bytes: 1450, FirstSeen: 1, LastSeen: 3}}
+	var firstOutput, secondOutput bytes.Buffer
+
+	firstSummary, err := fe.exportRecords([]flowRecord{first}, [dropMax]uint64{}, 4, 60, true, 10, &firstOutput, nil)
+	if err != nil {
+		t.Fatalf("first export: %v", err)
+	}
+	secondSummary, err := fe.exportRecords([]flowRecord{second}, [dropMax]uint64{}, 5, 60, true, 10, &secondOutput, nil)
+	if err != nil {
+		t.Fatalf("second export: %v", err)
+	}
+	if firstSummary.totalPackets != 10 || firstSummary.totalBytes != 1000 {
+		t.Fatalf("unexpected initial counters: %+v", firstSummary)
+	}
+	if secondSummary.totalPackets != 3 || secondSummary.totalBytes != 450 {
+		t.Fatalf("unexpected delta counters: %+v", secondSummary)
+	}
+	var record map[string]interface{}
+	if err := json.Unmarshal(secondOutput.Bytes(), &record); err != nil {
+		t.Fatalf("decode delta output: %v", err)
+	}
+	if record["packets"] != float64(3) || record["bytes"] != float64(450) {
+		t.Fatalf("unexpected delta record: %v", record)
+	}
+}
+
+func TestExportRecordsTreatsNewGenerationAsNewFlow(t *testing.T) {
+	fe := &flowExporter{}
+	key := flowFlowKey{SrcPort: 1000, DstPort: 80, Protocol: 6}
+	var output bytes.Buffer
+
+	_, err := fe.exportRecords([]flowRecord{{key: key, stats: flowFlowStats{Generation: 7, Packets: 10, Bytes: 1000}}}, [dropMax]uint64{}, 1, 60, false, 10, &output, nil)
+	if err != nil {
+		t.Fatalf("first export: %v", err)
+	}
+	output.Reset()
+	summary, err := fe.exportRecords([]flowRecord{{key: key, stats: flowFlowStats{Generation: 8, Packets: 2, Bytes: 200}}}, [dropMax]uint64{}, 2, 60, false, 10, &output, nil)
+	if err != nil {
+		t.Fatalf("new generation export: %v", err)
+	}
+	if summary.totalPackets != 2 || summary.totalBytes != 200 {
+		t.Fatalf("new generation must export cumulative initial counters: %+v", summary)
+	}
+}
+
+func TestExportRecordsDeduplicatesRepeatedSnapshot(t *testing.T) {
+	fe := &flowExporter{}
+	record := flowRecord{
+		key:   flowFlowKey{SrcPort: 1000, DstPort: 80, Protocol: 6},
+		stats: flowFlowStats{Generation: 7, Packets: 2, Bytes: 200},
+	}
+	var output bytes.Buffer
+
+	summary, err := fe.exportRecords([]flowRecord{record, record}, [dropMax]uint64{}, 1, 60, false, 10, &output, nil)
+	if err != nil {
+		t.Fatalf("export repeated snapshot: %v", err)
+	}
+	if summary.currentFlows != 1 || summary.exportedCount != 1 || summary.totalPackets != 2 {
+		t.Fatalf("unexpected deduplicated summary: %+v", summary)
+	}
+	if lines := strings.Count(strings.TrimSpace(output.String()), "\n") + 1; lines != 1 {
+		t.Fatalf("expected one output line, got %q", output.String())
 	}
 }
 
@@ -681,6 +1014,20 @@ func TestMetricLabelsArePreinitialized(t *testing.T) {
 			t.Fatalf("expected drop reason %q to be preinitialized", reason)
 		}
 	}
+
+	exportErrorsFamily := metricFamily(t, families, "flowcap_export_errors_total")
+	for _, stage := range exportErrorStageLabels {
+		if !hasMetricLabel(exportErrorsFamily, "stage", stage) {
+			t.Fatalf("expected export error stage %q to be preinitialized", stage)
+		}
+	}
+
+	statsErrorsFamily := metricFamily(t, families, "flowcap_stats_errors_total")
+	for _, operation := range statsErrorOperationLabels {
+		if !hasMetricLabel(statsErrorsFamily, "operation", operation) {
+			t.Fatalf("expected stats error operation %q to be preinitialized", operation)
+		}
+	}
 }
 
 func metricFamily(t *testing.T, families []*dto.MetricFamily, name string) *dto.MetricFamily {
@@ -718,4 +1065,17 @@ func counterValue(t *testing.T, label string) float64 {
 		t.Fatalf("counter.Write(%q): %v", label, err)
 	}
 	return metric.GetCounter().GetValue()
+}
+
+func counterVecValue(t *testing.T, counter *prometheus.CounterVec, label string) float64 {
+	t.Helper()
+	metric, err := counter.GetMetricWithLabelValues(label)
+	if err != nil {
+		t.Fatalf("GetMetricWithLabelValues(%q): %v", label, err)
+	}
+	var value dto.Metric
+	if err := metric.Write(&value); err != nil {
+		t.Fatalf("counter.Write(%q): %v", label, err)
+	}
+	return value.GetCounter().GetValue()
 }

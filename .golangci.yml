@@ -1,0 +1,38 @@
+version: "2"
+
+linters:
+  # Standard set: errcheck, govet, ineffassign, staticcheck, unused.
+  default: standard
+  enable:
+    # Security checks (weak crypto, file permissions, path traversal, ...).
+    - gosec
+    # Correct error wrapping and errors.Is/As usage.
+    - errorlint
+    # Unclosed HTTP response bodies.
+    - bodyclose
+    # HTTP requests and listeners created without context.
+    - noctx
+  settings:
+    gosec:
+      excludes:
+        # G104 (unhandled errors) duplicates errcheck from the standard set.
+        - G104
+        # G115 (integer overflow on conversion) flags every int<->uint64
+        # conversion between kernel timestamps and Go durations; those
+        # conversions are intentional and bounded by validated flag ranges.
+        - G115
+        # G302 (file permissions) flags the 0644 stats log file. The file is
+        # a log meant to be readable by collectors and logrotate.
+        - G302
+        # G304 (file inclusion via variable) flags reading
+        # /sys/class/net/<iface>/type; the interface name is validated by
+        # net.InterfaceByName before the read.
+        - G304
+  exclusions:
+    rules:
+      # Tests intentionally use fixed inputs, permissive file modes, and
+      # context-free helpers.
+      - path: _test\.go
+        linters:
+          - gosec
+          - noctx

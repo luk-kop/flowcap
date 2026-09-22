@@ -1,0 +1,23 @@
+name: Set up eBPF toolchain
+description: Install clang/LLVM and kernel headers, then regenerate the eBPF Go bindings
+
+runs:
+  using: composite
+  steps:
+    - name: Install eBPF dependencies
+      shell: bash
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y clang-18 llvm-18 linux-headers-$(uname -r) linux-libc-dev libc6-dev libbpf-dev iproute2
+        echo "BPF2GO_CC=clang-18" >> "$GITHUB_ENV"
+        echo "LLVM_OBJDUMP=llvm-objdump-18" >> "$GITHUB_ENV"
+
+    - name: Print eBPF toolchain versions
+      shell: bash
+      run: |
+        clang-18 --version | head -n 1
+        uname -r
+
+    - name: Generate eBPF bindings
+      shell: bash
+      run: make generate
